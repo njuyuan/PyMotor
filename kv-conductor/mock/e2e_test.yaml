@@ -1,0 +1,64 @@
+# ── ConfigMap for publisher config ────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-zmq-config
+  namespace: mindie-motor
+data:
+  block_size: "128"
+  interval:   "2.0"
+  tenant_id:  "default"
+  initial_blocks: "8192"
+  model: "opt-125m"
+
+---
+# ── KV Conductor ──────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mindie-motor-kv-conductor
+  labels:
+    app: mindie-motor-kv-conductor
+  namespace: mindie-motor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mindie-motor-kv-conductor
+  template:
+    metadata:
+      labels:
+        app: mindie-motor-kv-conductor
+    spec:
+      terminationGracePeriodSeconds: 5
+      automountServiceAccountToken: false
+      containers:
+      - image: kv-conductor:latest
+        imagePullPolicy: IfNotPresent
+        name: kv-conductor
+        env:
+        - name: RUST_LOG
+          value: info,kv_conductor::indexer=debug,kv_conductor::events=debug,kv_conductor::zmq_subscriber=debug
+        ports:
+        - containerPort: 13333
+          protocol: TCP
+        resources:
+          requests: {memory: "256Mi", cpu: "4"}
+          limits:   {memory: "1Gi", cpu: "8"}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: mindie-motor-kv-conductor
+  name: kv-conductor
+  namespace: mindie-motor
+spec:
+  ports:
+  - port: 13333
+    protocol: TCP
+    targetPort: 13333
+  selector:
+    app: mindie-motor-kv-conductor
+  type: ClusterIP
