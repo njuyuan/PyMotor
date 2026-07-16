@@ -52,9 +52,7 @@ class TestPolicyFactory(unittest.TestCase):
 
     def test_scheduling_policy_factory_create(self):
         """SchedulingPolicyFactory.create delegates to the module-level create()."""
-        policy = SchedulingPolicyFactory.create(
-            SchedulerType.ROUND_ROBIN, MockInstanceProvider()
-        )
+        policy = SchedulingPolicyFactory.create(SchedulerType.ROUND_ROBIN, MockInstanceProvider())
         self.assertIsInstance(policy, RoundRobinPolicy)
 
     def test_register_custom_policy(self):

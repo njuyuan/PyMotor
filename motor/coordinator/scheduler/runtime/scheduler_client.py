@@ -1259,11 +1259,7 @@ class AsyncSchedulerClient:
                     start_index=start_index,
                 )
                 if candidates:
-                    candidate_policy = (
-                        CANDIDATE_POLICY_SMETRIC
-                        if uses_affinity
-                        else CANDIDATE_POLICY_LOAD_BALANCE
-                    )
+                    candidate_policy = CANDIDATE_POLICY_SMETRIC if uses_affinity else CANDIDATE_POLICY_LOAD_BALANCE
                     return candidates, candidate_policy
             candidates = self._select_endpoint_candidates_by_load_balance(instances, role, top_k)
             if candidates:

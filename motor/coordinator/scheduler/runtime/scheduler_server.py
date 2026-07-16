@@ -691,9 +691,7 @@ class _SchedulerRequestDispatcher:
                 return selected
         if candidate_policy == CANDIDATE_POLICY_SMETRIC:
             selected = self._select_authoritative_candidate(candidate, role)
-            if selected is not None and not self._is_smetric_target_overloaded(
-                selected[1], role
-            ):
+            if selected is not None and not self._is_smetric_target_overloaded(selected[1], role):
                 return selected
             load_balanced = self._select_global_load_balance_candidate(role)
             if load_balanced is not None:
