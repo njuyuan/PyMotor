@@ -18,12 +18,12 @@ from motor.coordinator.scheduler.policy.factory import (
     create,
     register,
     SchedulingPolicyFactory,
-    _REGISTRY,
 )
 from motor.config.coordinator import SchedulerType
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
 from tests.coordinator.scheduler.conftest import MockInstanceProvider
 
 
@@ -40,6 +40,11 @@ class TestPolicyFactory(unittest.TestCase):
         policy = create(SchedulerType.LOAD_BALANCE, MockInstanceProvider())
         self.assertIsInstance(policy, LoadBalancePolicy)
 
+    def test_create_smetric(self):
+        """create returns an SMetricPolicy for SMETRIC type."""
+        policy = create(SchedulerType.SMETRIC, MockInstanceProvider())
+        self.assertIsInstance(policy, SMetricPolicy)
+
     def test_create_unknown_type_raises(self):
         """create raises ValueError for unregistered type."""
         with self.assertRaises(ValueError):
@@ -47,9 +52,7 @@ class TestPolicyFactory(unittest.TestCase):
 
     def test_scheduling_policy_factory_create(self):
         """SchedulingPolicyFactory.create delegates to the module-level create()."""
-        policy = SchedulingPolicyFactory.create(
-            SchedulerType.ROUND_ROBIN, MockInstanceProvider()
-        )
+        policy = SchedulingPolicyFactory.create(SchedulerType.ROUND_ROBIN, MockInstanceProvider())
         self.assertIsInstance(policy, RoundRobinPolicy)
 
     def test_register_custom_policy(self):
