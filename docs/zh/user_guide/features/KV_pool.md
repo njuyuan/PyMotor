@@ -131,7 +131,7 @@ pyMotor开启KV池化能力只需修改user_config.json配置文件后，通过d
 - `protocol`：底层传输协议，默认为 `ascend`。
 - `device_name`：指定绑定的网卡名称，为空则自动选择。
 - `global_segment_size`：全局共享显存段大小，默认为 `1GB`。
-- `eviction_high_watermark_ratio` 与 `eviction_ratio`：用于 `mooncake_master` 进程启动参数，分别代表池化空间高水位驱逐线与单次驱逐比例。
+- `eviction_high_watermark_ratio` 与 `eviction_ratio`：用于 `mooncake_master` 进程启动参数，分别代表池化空间高水位驱逐线与单次驱逐比例；若未配置，`deploy.py` 会分别按默认值 `0.9` 与 `0.1` 进行补充。
 - `port`：（可选）用于配置 KV Pool 的服务端口；若未配置，`deploy.py` 会按默认值 `50088` 进行补充和适配。
 - `default_kv_lease_ttl`：（可选）控制 KV 对象的默认租约 TTL（毫秒）；配置值需大于`env.json`中vllm实例的环境变量`ASCEND_CONNECT_TIMEOUT`和`ASCEND_TRANSFER_TIMEOUT`。默认值11000。
 
