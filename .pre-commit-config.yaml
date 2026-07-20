@@ -85,28 +85,51 @@ repos:
           - "--verbose"
           - "-i"
 
-  # ---------- Rust checks (kv-conductor) ----------
+  # ======== Local custom hooks ========
   - repo: local
     hooks:
-      - id: cargo-fmt
-        name: cargo fmt (Rust code formatter)
-        entry: cargo fmt --manifest-path kv-conductor/Cargo.toml --all
-        language: system
-        types: [rust]
-        files: ^kv-conductor/
-        pass_filenames: false
+      # --- Header check & cleanup ---
+      # Removes useless coding/shebang lines; ensures Mulan PSL v2 license block is present.
+      # Excludes pre-commit/ (hook scripts must be executable → need shebang).
+      - id: check-header
+        name: header check & cleanup
+        entry: pre-commit/check_header.py
+        language: python
+        types: [python]
+        exclude: >
+          (?x)^(
+            pre-commit/|
+            build/|
+            .*_pb2\.py$|
+            .*_pb2_grpc\.py$|
+            .*_grpc\.py$|
+            .*\.egg-info/|
+            .*__pycache__/
+          )
+        pass_filenames: true
 
-      - id: cargo-clippy
-        name: cargo clippy (Rust linter)
-        entry: cargo clippy --manifest-path kv-conductor/Cargo.toml -- -D warnings
-        language: system
-        types: [rust]
-        files: ^kv-conductor/
-        pass_filenames: false
+      # --- Modern Python typing ---
+      # Detects Optional[X], Dict[K,V], List[X], Tuple[X], Set[X], FrozenSet[X],
+      # Type[X], Union[X,Y] and auto-rewrites to Python 3.10+ native syntax.
+      # Excludes deployer/ (out of scope).
+      - id: check-modern-typing
+        name: modern python typing check
+        entry: pre-commit/check_modern_typing.py
+        language: python
+        types: [python]
+        exclude: >
+          (?x)^(
+            deployer/|
+            build/|
+            .*_pb2\.py$|
+            .*_pb2_grpc\.py$|
+            .*_grpc\.py$|
+            .*\.egg-info/|
+            .*__pycache__/
+          )
+        pass_filenames: true
 
-  # Log quality: basic checks on motor/ production code (incremental; warnings do not block by default)
-  - repo: local
-    hooks:
+      # Log quality: basic checks on motor/ production code (incremental; warnings do not block by default)
       - id: log-quality-basic
         name: log quality basic check
         entry: pre-commit/check_log_quality.py --incremental
@@ -115,3 +138,18 @@ repos:
         files: ^motor/
         exclude: ^motor/.*/tests/
         pass_filenames: true
+
+  # -------------------------- Gitleaks 本地离线二进制扫描 --------------------------
+  - repo: local
+    hooks:
+      - id: gitleaks-offline-scan
+        name: Gitleaks Secret Scan(Local Binary)
+        entry: ./gitleaks
+        language: system
+        pass_filenames: true
+        args:
+          - protect
+          - --verbose
+          - --redact
+          - --config=pre-commit/.gitleaks.toml
+        stages: [pre-commit]

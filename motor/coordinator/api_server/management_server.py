@@ -161,11 +161,7 @@ class ManagementServer(BaseCoordinatorServer):
 
     def _start_re_register_task(self) -> None:
         """Start the periodic KV instance re-register background task."""
-        kv_reg = self.coordinator_config.scheduler_config.kv_conductor_config
-        interval = kv_reg.re_register_interval_sec
-        if interval <= 0:
-            # Fallback to legacy prefill_kv_event_config for backward compatibility
-            interval = self.coordinator_config.prefill_kv_event_config.re_register_interval_sec
+        interval = self.coordinator_config.prefill_kv_event_config.re_register_interval_sec
         if interval <= 0:
             logger.info("KV instance re-register timer is disabled (re_register_interval_sec=%s)", interval)
             return

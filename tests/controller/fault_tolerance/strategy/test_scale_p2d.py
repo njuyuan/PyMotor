@@ -134,15 +134,10 @@ def test_execute_succeeds_when_recovery_flow_passes(strategy):
 
 
 def test_execute_fails_when_d_instance_still_active(strategy):
-    """D instance has recovered (ACTIVE) before ScaleP2D preemption — strategy should fail."""
     d_inst = _decode_instance(status=InsStatus.ACTIVE)
 
     with patch("motor.controller.fault_tolerance.strategy.scale_p2d.InstanceManager") as mock_im_cls:
-        mock_im = mock_im_cls.return_value
-        mock_im.get_instance.return_value = d_inst
-        # _check_d_instance_status looks up the D instance by job_name;
-        # returning the ACTIVE instance causes it to abort immediately.
-        mock_im.get_instance_by_job_name.return_value = d_inst
+        mock_im_cls.return_value.get_instance.return_value = d_inst
         with patch.object(strategy, "_get_faulty_node_count", return_value=0):
             with patch.object(strategy, "_check_d_instance_status", return_value=False):
                 strategy.execute(1)

@@ -30,8 +30,13 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 
 from motor.engine_server.core.vllm.vllm_openai_compat import (
     RequestLogger,
+    call_openai_serving,
     kwargs_matching_signature,
-    openai_http_response_from_generator,
+)
+from motor.engine_server.core.vllm.prefill_context_validation import (
+    activate_prefill_context_check,
+    install_chat_render_validator,
+    reset_prefill_context_check,
 )
 
 
@@ -83,7 +88,16 @@ class OpenAIServingChat:
             response_role,
             **chat_kw,
         )
+        install_chat_render_validator(self._vllm_serving_chat)
 
     async def handle_request(self, request: ChatCompletionRequest, raw_request: Request):
-        generator = await self._vllm_serving_chat.create_chat_completion(request, raw_request)
-        return openai_http_response_from_generator(generator, ChatCompletionResponse)
+        check = getattr(raw_request.state, "motor_prefill_context_check", None)
+        token = activate_prefill_context_check(check)
+        try:
+            return await call_openai_serving(
+                self._vllm_serving_chat,
+                lambda: self._vllm_serving_chat.create_chat_completion(request, raw_request),
+                ChatCompletionResponse,
+            )
+        finally:
+            reset_prefill_context_check(token)

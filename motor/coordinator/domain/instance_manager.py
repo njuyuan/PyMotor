@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -13,6 +12,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from motor.common.logger import get_logger
+from motor.common.logger.rate_limited_logger import RateLimitedLogger
 from motor.common.resources.dispatch import has_compatible_dispatch_pair
 from motor.common.resources.instance import Instance, PDRole, Workload, Endpoint
 from motor.common.resources.http_msg_spec import EventType
@@ -26,11 +26,43 @@ TYPE_MGMT = "mgmt"
 TYPE_OBS = "obs"
 
 logger = get_logger(__name__)
+_rl = RateLimitedLogger(logger)
 
 
 def _role_to_pdrole(role: PDRole | str) -> PDRole:
     """Normalize role to PDRole for use as _available_role_pools key (avoid str/enum key mismatch)."""
     return PDRole(role) if isinstance(role, str) else role
+
+
+def _clamp_workload_floor(workload: Workload) -> bool:
+    """Clamp negative workload fields to 0 in place. Returns True if any field was clamped."""
+    floored = False
+    if workload.active_tokens < 0:
+        workload.active_tokens = 0.0
+        floored = True
+    if workload.active_kv_cache < 0:
+        workload.active_kv_cache = 0.0
+        floored = True
+    return floored
+
+
+def _rebuild_instance_workload(instance: Instance) -> bool:
+    """Rebuild an instance workload from its endpoint ledgers and floor invalid values."""
+    active_tokens = 0.0
+    active_kv_cache = 0.0
+    floored = False
+    for pod_endpoints in (instance.endpoints or {}).values():
+        for endpoint in (pod_endpoints or {}).values():
+            if endpoint.workload is None:
+                endpoint.workload = Workload()
+            floored = _clamp_workload_floor(endpoint.workload) or floored
+            active_tokens += endpoint.workload.active_tokens
+            active_kv_cache += endpoint.workload.active_kv_cache
+    instance.gathered_workload = Workload(
+        active_tokens=active_tokens,
+        active_kv_cache=active_kv_cache,
+    )
+    return floored
 
 
 class UpdateInstanceMode(str, Enum):
@@ -137,37 +169,92 @@ class InstanceManager:
             unavail_items = list(self._unavailable_pool.items())
         return dict(avail_items), dict(unavail_items)
 
-    async def update_instance_workload(self, instance_id: int, endpoint_id: int, workload_change: Workload) -> None:
-        """Update workload of instance and its endpoint in pool (ids only). O(1) lookup via _endpoint_id_cache."""
-        async with self._lock:
-            instance = self._available_pool.get(instance_id)
-            if instance is None:
-                logger.warning("Instance ID %s not found in available pool while updating workload", instance_id)
-                return
-            ep_cache = self._endpoint_id_cache.get(instance_id)
-            if ep_cache is None:
-                ep_cache = {}
-                for pod_eps in (instance.endpoints or {}).values():
-                    for ep in (pod_eps or {}).values():
-                        ep_cache[ep.id] = ep
-                self._endpoint_id_cache[instance_id] = ep_cache
-            endpoint = ep_cache.get(endpoint_id)
-            if endpoint is None:
-                logger.warning(
-                    "Endpoint ID %s not found in instance ID %s while updating workload",
-                    endpoint_id,
-                    instance_id,
-                )
-                return
-            wlock = self._workload_locks.setdefault(instance_id, asyncio.Lock())
-        async with wlock:
+    def update_instance_workload_sync(
+        self,
+        instance_id: int,
+        endpoint_id: int,
+        workload_change: Workload,
+    ) -> tuple[PDRole | None, Workload | None]:
+        """Synchronously update workload and return the endpoint's new workload."""
+        instance = self._available_pool.get(instance_id)
+        if instance is None:
+            logger.warning("Instance ID %s not found in available pool while updating workload", instance_id)
+            return (None, None)
+        ep_cache = self._endpoint_id_cache.get(instance_id)
+        if ep_cache is None:
+            ep_cache = {}
+            for pod_eps in (instance.endpoints or {}).values():
+                for ep in (pod_eps or {}).values():
+                    ep_cache[ep.id] = ep
+            self._endpoint_id_cache[instance_id] = ep_cache
+        endpoint = ep_cache.get(endpoint_id)
+        if endpoint is None:
+            logger.warning(
+                "Endpoint ID %s not found in instance ID %s while updating workload",
+                endpoint_id,
+                instance_id,
+            )
+            return (None, None)
+        endpoint.workload += workload_change
+        # Ledger floor: workload is an unbounded signed accumulator updated by ALLOCATION(+) /
+        # RELEASE(-) deltas. A release that exceeds the endpoint's outstanding allocation (e.g. a
+        # duplicated/late release, or one whose allocation was reset) would drive the counter
+        # negative and make this endpoint a permanent minimum-score scheduling magnet. Clamp to
+        # zero so it self-heals, and warn (rate-limited) so the reconciliation gap stays visible.
+        if _clamp_workload_floor(endpoint.workload):
+            # Over-release path (rare): rebuild the aggregate from the endpoint ledgers so a floored
+            # endpoint can't hide positive load on its siblings. Independently flooring the aggregate
+            # would mask that sibling load.
+            _rebuild_instance_workload(instance)
+            _rl.error_window(
+                f"workload_floor:{instance_id}:{endpoint_id}",
+                "Workload floored to 0 (release exceeded allocation, accounting gap) "
+                f"instance_id={instance_id} endpoint_id={endpoint_id} "
+                f"change=(tokens={workload_change.active_tokens},kv={workload_change.active_kv_cache})",
+                window_sec=60,
+                level="WARNING",
+            )
+        else:
+            # Fast path: the endpoint ledger stayed non-negative, so the invariant
+            # gathered_workload == sum(endpoint ledgers) still holds; maintain it in O(1) instead of
+            # rescanning every endpoint of the instance on this hot path.
             instance.gathered_workload += workload_change
-            endpoint.workload += workload_change
         logger.debug(
             "Updated workload instance_id=%s endpoint_id=%s",
             instance_id,
             endpoint_id,
         )
+        role = _role_to_pdrole(instance.role) if instance.role else PDRole.ROLE_U
+        return (role, endpoint.workload)
+
+    async def update_instance_workload(self, instance_id: int, endpoint_id: int, workload_change: Workload) -> None:
+        """Update workload of instance and its endpoint in pool (ids only). O(1) lookup via _endpoint_id_cache."""
+        self.update_instance_workload_sync(instance_id, endpoint_id, workload_change)
+
+    def get_endpoint_workload_sync(self, instance_id: int, endpoint_id: int) -> tuple[PDRole | None, Workload | None]:
+        """
+        Get role and workload for endpoint by instance_id and endpoint_id.
+        Used by WorkloadSharedMemoryWriter.write_single_entry for incremental write.
+
+        Returns:
+            (role, workload): (instance.role, endpoint.workload) if found;
+            (None, None) if instance or endpoint does not exist.
+        """
+        instance = self._available_pool.get(instance_id)
+        if instance is None:
+            return (None, None)
+        ep_cache = self._endpoint_id_cache.get(instance_id)
+        if ep_cache is None:
+            ep_cache = {}
+            for pod_eps in (instance.endpoints or {}).values():
+                for ep in (pod_eps or {}).values():
+                    ep_cache[ep.id] = ep
+            self._endpoint_id_cache[instance_id] = ep_cache
+        endpoint = ep_cache.get(endpoint_id)
+        if endpoint is None:
+            return (None, None)
+        role = _role_to_pdrole(instance.role) if instance.role else PDRole.ROLE_U
+        return (role, endpoint.workload)
 
     async def get_endpoint_workload(self, instance_id: int, endpoint_id: int) -> tuple[PDRole | None, Workload | None]:
         """
@@ -178,22 +265,7 @@ class InstanceManager:
             (role, workload): (instance.role, endpoint.workload) if found;
             (None, None) if instance or endpoint does not exist.
         """
-        async with self._lock:
-            instance = self._available_pool.get(instance_id)
-            if instance is None:
-                return (None, None)
-            ep_cache = self._endpoint_id_cache.get(instance_id)
-            if ep_cache is None:
-                ep_cache = {}
-                for pod_eps in (instance.endpoints or {}).values():
-                    for ep in (pod_eps or {}).values():
-                        ep_cache[ep.id] = ep
-                self._endpoint_id_cache[instance_id] = ep_cache
-            endpoint = ep_cache.get(endpoint_id)
-            if endpoint is None:
-                return (None, None)
-            role = _role_to_pdrole(instance.role) if instance.role else PDRole.ROLE_U
-            return (role, endpoint.workload)
+        return self.get_endpoint_workload_sync(instance_id, endpoint_id)
 
     async def has_instance_endpoint(self, instance_id: int, endpoint_id: int) -> bool:
         """Check if (instance_id, endpoint_id) exists in available pool. For ALLOCATE_ONLY validation."""
@@ -348,9 +420,9 @@ class InstanceManager:
             return
 
         if is_register:
-            ConductorApiClient.register_kv_instance(instances)
+            ConductorApiClient().register_kv_instance(instances)
         else:
-            ConductorApiClient.unregister_kv_instance(instances)
+            ConductorApiClient().unregister_kv_instance(instances)
 
     def _add_instances(self, instances: list[Instance]) -> bool:
         """Add instances to pool. Return True if at least one instance was actually added (pool modified)."""

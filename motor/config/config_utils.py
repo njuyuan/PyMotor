@@ -1,5 +1,12 @@
-# coding=utf-8
-# Copyright (c) 2025, HUAWEI CORPORATION.  All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+# MindIE is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#         http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
 
 import json
 import os
@@ -65,7 +72,7 @@ class ConfigKey(Enum):
     MOTOR_ENGINE_PREFILL = "motor_engine_prefill_config"
     MOTOR_ENGINE_DECODE = "motor_engine_decode_config"
     MOTOR_NODEMANAGER = "motor_nodemanger_config"
-    MOTOR_KV_POOL = "kv_cache_pool_config"
+    MOTOR_KV_STORE = "kv_cache_store_config"
 
     @staticmethod
     def is_valid(config_key: str) -> bool:
@@ -254,9 +261,6 @@ def _select_kv_event_engine_section(user_config_data: dict[str, Any]) -> dict[st
     return None
 
 
-KV_CONDUCTOR_CONFIG = "kv_conductor_config"
-
-
 def _update_prefill_kv_event_config(updated_config: dict[str, Any], user_config_data: dict[str, Any]) -> None:
     try:
         engine_section = _select_kv_event_engine_section(user_config_data)
@@ -270,49 +274,6 @@ def _update_prefill_kv_event_config(updated_config: dict[str, Any], user_config_
         updated_config[PREFILL_KV_EVENT_CONFIG] = prefill_kv_event
     except Exception as e:
         logger.warning("Failed to get kv event engine config: %s", e)
-
-
-def _redirect_prefill_kv_event_config(updated_config: dict[str, Any], user_config_data: dict[str, Any]) -> None:
-    """Redirect legacy prefill_kv_event_config into the unified kv_conductor_config.
-
-    1. If the user config still has a ``prefill_kv_event_config`` section, merge its
-       fields into ``kv_conductor_config`` (backward compat).
-    2. Auto-derive connection info from engine sections and kv_conductor_config.
-    """
-    try:
-        reg = updated_config.setdefault("scheduler_config", {}).setdefault(KV_CONDUCTOR_CONFIG, {})
-
-        # ── Backward compat: migrate old prefill_kv_event_config ──────
-        old_config = updated_config.pop(PREFILL_KV_EVENT_CONFIG, None)
-        if isinstance(old_config, dict):
-            logger.warning(
-                "prefill_kv_event_config is deprecated and will be removed in a future version. "
-                "Please migrate to kv_conductor_config under scheduler_config. "
-                "See docs/zh/user_guide/features/kvcache_affinity.md for details."
-            )
-            for key in (
-                "conductor_service",
-                "http_server_port",
-                "engine_type",
-                "model_path",
-                "block_size",
-                "endpoint",
-                "replay_endpoint",
-                "re_register_interval_sec",
-            ):
-                if key in old_config and not reg.get(key):
-                    reg[key] = old_config[key]
-
-        # ── Auto-derive from engine sections ──────────────────────────
-        engine_section = _select_kv_event_engine_section(user_config_data)
-        if engine_section is not None:
-            derived = _build_prefill_kv_event_from_engine_section(engine_section, user_config_data)
-            if isinstance(derived, dict):
-                for key in ("http_server_port", "model_path", "endpoint", "replay_endpoint", "block_size"):
-                    if key in derived and not reg.get(key):
-                        reg[key] = derived[key]
-    except Exception as e:
-        logger.warning("Failed to redirect kv event config: %s", e)
 
 
 def log_json_config_format_error(json_path: str | None, exc: Exception) -> None:

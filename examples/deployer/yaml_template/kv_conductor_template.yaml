@@ -41,11 +41,7 @@ spec:
               value: /usr/local/Ascend/pyMotor/conf
             - name: ROLE
               value: kv_conductor
-            - name: RUST_LOG
-              value: info
-          command: ["/bin/bash", "-c", "
-              source /mnt/configmap/boot.sh; \n
-          "]
+          command: ["/bin/bash", "-c", "source /mnt/configmap/boot.sh;"]
           resources:
             requests:
               memory: "2Gi"

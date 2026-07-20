@@ -108,8 +108,6 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
                 continue  # still alive, no restart
             old_prefix = self._pod_prefix(old_name)
             candidates = new_by_prefix.get(old_prefix, [])
-            # Only flag as restarted if there's exactly one new pod for this
-            # prefix and the old one is gone (not just a multi-replica false positive)
             if len(candidates) == 1:
                 self._pod_progress.remove(old_name)
                 current_set.discard(old_name)
@@ -117,6 +115,11 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
                     f"{C.Style.YELLOW}Pod restarted: {old_name} → {candidates[0]}{C.Style.RESET}",
                     2.0,
                 )
+            elif len(candidates) > 1:
+                # Multiple pods replaced at once (e.g. rolling update) —
+                # still clean up the stale entry but don't try to map 1:1
+                self._pod_progress.remove(old_name)
+                current_set.discard(old_name)
 
     # ------------------------------------------------------------------
     # Pod status watcher ("kubectl get pods" overview)
@@ -205,7 +208,11 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
             self._start_progress_monitor()
 
     def _start_progress_monitor(self) -> None:
-        """Discover pods and start per-pod log monitor threads."""
+        """Discover pods and start per-pod log monitor threads.
+
+        Does a single non-blocking scan; * _rescan_pods* (called every 5 s
+        from the main loop) picks up pods that appear later.
+        """
         from .step import VLLMProgressMonitor, shell_get_pod  # pylint: disable=import-outside-toplevel
 
         if self._ctx is None:
@@ -217,18 +224,7 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
         self._cleanup_monitors()
         self._cancel_event.clear()
 
-        # Wait briefly for pods
-        list_pod = None
-        self._set_status(
-            f"{C.Style.DIM}Scanning for pods in {self.namespace}...{C.Style.RESET}",
-            duration=5,
-        )
-        deadline = time.monotonic() + C.POD_WAIT_INTERVAL * 2
-        while self._running and time.monotonic() < deadline:
-            list_pod = shell_get_pod(self.namespace)
-            if list_pod and len(list_pod) >= self.pod_cnt:
-                break
-            time.sleep(0.5)
+        list_pod = shell_get_pod(self.namespace)
 
         if not list_pod:
             self._set_status(
@@ -541,13 +537,11 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
             return
 
         config_dir = config_dir.strip()
-        self._last_config_dir = config_dir
         abs_dir = os.path.join(self.deployer_dir, config_dir)
 
         # Validate
         user_json = os.path.join(abs_dir, "user_config.json")
         if not os.path.exists(user_json):
-            self._last_config_dir = ""
             self._set_status(
                 f"{C.Style.RED}✗ user_config.json not found in {abs_dir}{C.Style.RESET}",
                 3.0,
@@ -612,6 +606,7 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
         self.pod_cnt = deploy_mod.calculate_pod_count(deploy_config)
         self.user_config = user_config
         self._deployed = True
+        self._last_config_dir = config_dir
         self._menu_selected = 0
 
         # Save log lines and immediately write them below the current box so
@@ -658,7 +653,6 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
             return
 
         config_dir = config_dir.strip()
-        self._last_config_dir = config_dir
 
         try:
             from lib.utils import read_json
@@ -671,10 +665,10 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
 
             deploy_mod.handle_update_config(user_config)
         except Exception as e:
-            self._last_config_dir = ""
             self._set_status(f"{C.Style.RED}✗ Update failed: {e}{C.Style.RESET}", 3.0)
             return
 
+        self._last_config_dir = config_dir
         self._set_status(
             f"{C.Style.BOLD}{C.Style.GREEN}✓{C.Style.RESET}  {C.Style.GREEN}Config updated.{C.Style.RESET}",
             2.0,

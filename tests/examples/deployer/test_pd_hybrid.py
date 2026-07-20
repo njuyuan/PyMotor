@@ -1,3 +1,13 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+# MindIE is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#         http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+
 import json
 import os
 import shutil
@@ -81,8 +91,8 @@ def make_deploy_paths(tmp_path):
         "coordinator_output_yaml": str(tmp_path / "mindie_motor_coordinator.yaml"),
         "engine_input_yaml": str(DEPLOYER_ROOT / "yaml_template" / "engine_template.yaml"),
         "engine_output_yaml": str(tmp_path / k8s_utils.g_engine_base_name),
-        "kv_pool_input_yaml": str(DEPLOYER_ROOT / "yaml_template" / "kv_pool_template.yaml"),
-        "kv_pool_output_yaml": str(tmp_path / "mindie_motor_kv_pool.yaml"),
+        "kv_store_input_yaml": str(DEPLOYER_ROOT / "yaml_template" / "kv_cache_store_template.yaml"),
+        "kv_store_output_yaml": str(tmp_path / "mindie_motor_kv_store.yaml"),
         "kv_conductor_input_yaml": str(DEPLOYER_ROOT / "yaml_template" / "kv_conductor_template.yaml"),
         "kv_conductor_output_yaml": str(tmp_path / "mindie_motor_kv_conductor.yaml"),
         "infer_service_input_yaml": str(DEPLOYER_ROOT / "yaml_template" / "infer_service_template.yaml"),
@@ -118,7 +128,15 @@ def test_validate_pd_hybrid_config_rejects_mixed_schema(mutate):
         validate_pd_hybrid_config(user_config)
 
 
-def test_generate_yaml_engine_creates_hybrid_workload(tmp_path):
+def test_generate_yaml_engine_creates_hybrid_workload(tmp_path, monkeypatch):
+    cluster_accelerator_type = "module-a3-16"
+    k8s_utils._g_accelerator_type_cache.clear()
+    monkeypatch.setattr(
+        k8s_utils,
+        "get_accelerator_type_from_cluster",
+        lambda _hardware_type: cluster_accelerator_type,
+    )
+
     user_config = make_pd_hybrid_user_config()
     input_yaml = DEPLOYER_ROOT / "yaml_template" / "engine_template.yaml"
     output_base = tmp_path / "mindie_server"
@@ -134,10 +152,13 @@ def test_generate_yaml_engine_creates_hybrid_workload(tmp_path):
 
     container = data[C.SPEC][C.TEMPLATE][C.SPEC][C.CONTAINERS][0]
     env = {item[C.NAME]: item[C.VALUE] for item in container[C.ENV] if C.VALUE in item}
+    node_selector = data[C.SPEC][C.TEMPLATE][C.SPEC][C.NODE_SELECTOR]
     assert env[C.ENV_ROLE] == C.ROLE_UNION
     assert data[C.SPEC][C.REPLICAS] == 1
     assert container[C.RESOURCES][C.REQUESTS][C.ASCEND_910_NPU_NUM] == 4
     assert container[C.RESOURCES][C.LIMITS][C.ASCEND_910_NPU_NUM] == 4
+    assert node_selector[C.ACCELERATOR_TYPE] == cluster_accelerator_type
+    assert node_selector[C.ACCELERATOR_TYPE] != C.ACCELERATOR_TYPE_910B
 
 
 def test_deploy_services_dry_run_uses_infer_service_set_for_hybrid(tmp_path, monkeypatch):
@@ -223,7 +244,7 @@ def test_set_env_to_shell_generates_union_env_function_for_hybrid(tmp_path, monk
         "motor_engine_decode_env": {"DECODE_ONLY_KEY": "decode"},
         "motor_controller_env": {},
         "motor_coordinator_env": {},
-        "motor_kv_cache_pool_env": {},
+        "motor_kv_cache_store_env": {},
         "motor_kv_conductor_env": {},
         "motor_mf_store_env": {},
     }
@@ -233,7 +254,7 @@ def test_set_env_to_shell_generates_union_env_function_for_hybrid(tmp_path, monk
     monkeypatch.setattr(C, "CONTROLLER_SHELL_PATH", str(controller_path))
     monkeypatch.setattr(C, "COORDINATOR_SHELL_PATH", str(coordinator_path))
     monkeypatch.setattr(C, "ENGINE_SHELL_PATH", str(engine_path))
-    monkeypatch.setattr(C, "KV_POOL_SHELL_PATH", str(kv_pool_path))
+    monkeypatch.setattr(C, "KV_CACHE_STORE_SHELL_PATH", str(kv_pool_path))
     monkeypatch.setattr(C, "KV_CONDUCTOR_SHELL_PATH", str(kv_conductor_path))
     monkeypatch.setattr(C, "MF_STORE_SHELL_PATH", str(mf_store_path))
     monkeypatch.setattr(C, "SINGLE_CONTAINER_SHELL_PATH", str(single_container_path))
@@ -350,8 +371,8 @@ def test_handle_update_instance_num_scales_hybrid_instances(tmp_path, monkeypatc
 
     assert any(path.endswith("_u2.yaml") for path in k8s_utils.g_generate_yaml_list)
     assert commands == [
-        f"kubectl apply -f {tmp_path / 'vllm_u1.yaml'} -n pd-hybrid",
-        f"kubectl apply -f {tmp_path / 'vllm_u2.yaml'} -n pd-hybrid",
+        ["kubectl", "apply", "-f", str(tmp_path / "vllm_u1.yaml"), "-n", "pd-hybrid"],
+        ["kubectl", "apply", "-f", str(tmp_path / "vllm_u2.yaml"), "-n", "pd-hybrid"],
     ]
 
 
@@ -367,8 +388,8 @@ def test_elastic_distributed_engine_deploy_scales_out_hybrid_instances(tmp_path,
     k8s_utils.elastic_distributed_engine_deploy(deploy_config, baseline_deploy_config, str(tmp_path))
 
     assert commands == [
-        f"kubectl apply -f {tmp_path / 'mindie_server_u1.yaml'} -n pd-hybrid",
-        f"kubectl apply -f {tmp_path / 'mindie_server_u2.yaml'} -n pd-hybrid",
+        ["kubectl", "apply", "-f", str(tmp_path / "mindie_server_u1.yaml"), "-n", "pd-hybrid"],
+        ["kubectl", "apply", "-f", str(tmp_path / "mindie_server_u2.yaml"), "-n", "pd-hybrid"],
     ]
 
 
@@ -386,8 +407,8 @@ def test_elastic_distributed_engine_deploy_scales_in_hybrid_instances(tmp_path, 
     k8s_utils.elastic_distributed_engine_deploy(deploy_config, baseline_deploy_config, str(tmp_path))
 
     assert commands == [
-        f"kubectl delete -f {tmp_path / 'mindie_server_u2.yaml'} -n pd-hybrid",
-        f"kubectl delete -f {tmp_path / 'mindie_server_u1.yaml'} -n pd-hybrid",
+        ["kubectl", "delete", "-f", str(tmp_path / "mindie_server_u2.yaml"), "-n", "pd-hybrid"],
+        ["kubectl", "delete", "-f", str(tmp_path / "mindie_server_u1.yaml"), "-n", "pd-hybrid"],
     ]
     assert not yaml_to_remove.exists()
 
@@ -487,7 +508,7 @@ def test_handle_update_instance_num_scales_hybrid_via_crd_when_current_omits_dep
 
     deploy_module.handle_update_instance_num(current_config)
 
-    assert commands == [f"kubectl apply -f {paths['infer_service_output_yaml']} -n pd-hybrid"]
+    assert commands == [["kubectl", "apply", "-f", paths["infer_service_output_yaml"], "-n", "pd-hybrid"]]
     all_docs = load_yaml(paths["infer_service_output_yaml"], False)
     infer_doc = _find_infer_service_set_doc(all_docs)
     assert get_infer_role(infer_doc, C.ROLE_UNION)[C.REPLICAS] == 2
@@ -515,7 +536,7 @@ def test_handle_update_instance_num_scales_hybrid_via_crd(tmp_path, monkeypatch)
 
     deploy_module.handle_update_instance_num(current_config)
 
-    assert commands == [f"kubectl apply -f {paths['infer_service_output_yaml']} -n pd-hybrid"]
+    assert commands == [["kubectl", "apply", "-f", paths["infer_service_output_yaml"], "-n", "pd-hybrid"]]
     all_docs = load_yaml(paths["infer_service_output_yaml"], False)
     infer_doc = _find_infer_service_set_doc(all_docs)
     assert get_infer_role(infer_doc, C.ROLE_UNION)[C.REPLICAS] == 2

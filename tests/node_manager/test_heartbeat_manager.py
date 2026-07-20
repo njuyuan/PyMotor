@@ -153,6 +153,18 @@ class TestHeartBeatManager:
         assert heart_beat_manager._endpoints[0].id == 1
         assert heart_beat_manager._endpoints[1].id == 2
 
+    def test_update_endpoint_resets_grace_period(self, heart_beat_manager, sample_start_cmd_msg):
+        """update_endpoint should restart grace period for engine cold start"""
+        heart_beat_manager._thread_started = True
+        heart_beat_manager._is_within_grace_period = False
+        heart_beat_manager._engine_status_thread_start_time = time.time() - 300
+
+        before = heart_beat_manager._engine_status_thread_start_time
+        heart_beat_manager.update_endpoint(sample_start_cmd_msg)
+
+        assert heart_beat_manager._is_within_grace_period is True
+        assert heart_beat_manager._engine_status_thread_start_time > before
+
     @patch('motor.node_manager.core.heartbeat_manager.EngineServerApiClient.query_status')
     def test_get_engine_server_status_success(self, mock_query_status, heart_beat_manager, sample_endpoints):
         """test get engine server status success"""
@@ -698,13 +710,13 @@ class TestHeartBeatManager:
     @patch("motor.node_manager.core.heartbeat_manager.EngineManager")
     def test_register_after_restore_success(self, mock_engine_manager_class, heart_beat_manager):
         mock_engine_manager = MagicMock()
-        mock_engine_manager.post_register_msg_after_restore.return_value = True
+        mock_engine_manager.post_register_msg.return_value = True
         mock_engine_manager_class.return_value = mock_engine_manager
 
         heart_beat_manager._register_after_restore()
 
         mock_engine_manager.register_prepare_after_restore.assert_called_once()
-        mock_engine_manager.post_register_msg_after_restore.assert_called_once()
+        mock_engine_manager.post_register_msg.assert_called_once()
         assert heart_beat_manager._is_registered_after_restore is True
 
     @patch("motor.node_manager.core.heartbeat_manager.EngineManager")
@@ -715,7 +727,7 @@ class TestHeartBeatManager:
 
         heart_beat_manager._register_after_restore()
 
-        mock_engine_manager.post_register_msg_after_restore.assert_not_called()
+        mock_engine_manager.post_register_msg.assert_not_called()
         assert heart_beat_manager._is_registered_after_restore is False
         assert heart_beat_manager._register_after_restore_retry_count == 1
 
@@ -735,14 +747,14 @@ class TestHeartBeatManager:
 
         def mock_stop_sleep(_seconds):
             call_count["count"] += 1
-            # First sleep happens after restore register; heartbeat is sent on the next loop.
+            # First sleep happens after register; heartbeat is sent on the next loop.
             if call_count["count"] >= 2:
                 heart_beat_manager.stop_event.set()
 
         mock_engine_manager = MagicMock()
         mock_engine_manager.is_engine_checkpoint_done.return_value = True
         mock_engine_manager.register_prepare_after_restore.return_value = None
-        mock_engine_manager.post_register_msg_after_restore.return_value = True
+        mock_engine_manager.post_register_msg.return_value = True
         mock_engine_manager_class.return_value = mock_engine_manager
         mock_report_heartbeat.return_value = None
         mock_sleep.side_effect = mock_stop_sleep
@@ -758,7 +770,7 @@ class TestHeartBeatManager:
         heart_beat_manager._report_heartbeat_loop()
 
         mock_engine_manager.register_prepare_after_restore.assert_called_once()
-        mock_engine_manager.post_register_msg_after_restore.assert_called_once()
+        mock_engine_manager.post_register_msg.assert_called_once()
         mock_report_heartbeat.assert_called_once()
 
     @patch("motor.node_manager.core.heartbeat_manager.is_restored_from_host_side_snapshot", return_value=True)

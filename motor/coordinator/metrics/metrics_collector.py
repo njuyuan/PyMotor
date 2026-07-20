@@ -15,12 +15,12 @@ import time
 import threading
 from collections.abc import Callable
 from typing import Any
-from urllib import request as urllib_request
-from urllib.error import URLError
+import requests
 
 from motor.common.resources.dispatch import DispatchPlan
 from motor.common.resources.instance import Instance
 from motor.common.logger import get_logger
+from motor.common.logger.rate_limited_logger import RateLimitedLogger
 from motor.common.utils.singleton import ThreadSafeSingleton
 from motor.config.coordinator import CoordinatorConfig
 from motor.coordinator.api_client.engine_server_api_client import EngineServerApiClient
@@ -39,9 +39,9 @@ logger = get_logger(__name__)
 _METRICS_FORMAT_PROMETHEUS = "prometheus"
 _METRICS_FORMAT_OPENTELEMETRY = "opentelemetry"
 
-# Mooncake Master -> a few kv_pool_* families with labels (cpu/ssd/all, usage/total/rate).
+# Mooncake Master -> a few kv_store_* families with labels (cpu/ssd/all, usage/total/rate).
 _BYTES_PER_GB = 1024**3
-_KVPOOL_METRIC_ALLOWLIST = frozenset(
+_KVSTORE_METRIC_ALLOWLIST = frozenset(
     {
         "master_allocated_bytes",
         "master_total_capacity_bytes",
@@ -52,11 +52,11 @@ _KVPOOL_METRIC_ALLOWLIST = frozenset(
         "master_attempted_evictions_total",
     }
 )
-_KVPOOL_FAMILY_HELP: dict[str, str] = {
-    "kv_pool_size": "KV pool size in GB (layer=cpu|ssd|all, stat=usage|total)",
-    "kv_pool_ratio": "KV pool used ratio 0-1 (layer=cpu|ssd|all, stat=usage_rate)",
-    "kv_pool_keys": "KV pool number of stored keys",
-    "kv_pool_eviction": "KV pool eviction counters (stat=success|attempts)",
+_KVSTORE_FAMILY_HELP: dict[str, str] = {
+    "kv_store_size": "KV store size in GB (layer=cpu|ssd|all, stat=usage|total)",
+    "kv_store_ratio": "KV store used ratio 0-1 (layer=cpu|ssd|all, stat=usage_rate)",
+    "kv_store_keys": "KV store number of stored keys",
+    "kv_store_eviction": "KV store eviction counters (stat=success|attempts)",
 }
 _SAMPLE_VALUE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{.*\})?\s+([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
 _PROM_SAMPLE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)$")
@@ -73,7 +73,7 @@ def _emit_labeled(
     if value < 0:
         return
     if name not in emitted_help:
-        lines.append(f"# HELP {name} {_KVPOOL_FAMILY_HELP[name]}")
+        lines.append(f"# HELP {name} {_KVSTORE_FAMILY_HELP[name]}")
         lines.append(f"# TYPE {name} gauge")
         emitted_help.add(name)
     if labels:
@@ -90,8 +90,8 @@ def _emit_layer_size(
     usage_bytes: float,
     total_bytes: float,
 ) -> None:
-    _emit_labeled(lines, emitted_help, "kv_pool_size", usage_bytes / _BYTES_PER_GB, layer=layer, stat="usage")
-    _emit_labeled(lines, emitted_help, "kv_pool_size", total_bytes / _BYTES_PER_GB, layer=layer, stat="total")
+    _emit_labeled(lines, emitted_help, "kv_store_size", usage_bytes / _BYTES_PER_GB, layer=layer, stat="usage")
+    _emit_labeled(lines, emitted_help, "kv_store_size", total_bytes / _BYTES_PER_GB, layer=layer, stat="total")
 
 
 def _emit_layer_rate(
@@ -102,13 +102,109 @@ def _emit_layer_rate(
     total_bytes: float,
 ) -> None:
     usage_rate = usage_bytes / total_bytes if total_bytes > 0 else 0.0
-    _emit_labeled(lines, emitted_help, "kv_pool_ratio", usage_rate, layer=layer, stat="usage_rate")
+    _emit_labeled(lines, emitted_help, "kv_store_ratio", usage_rate, layer=layer, stat="usage_rate")
 
 
-def _filter_kvpool_metrics(raw: str) -> str:
-    """Filter Mooncake Master metrics to labeled kv_pool_* families."""
+def _filter_kvstore_metrics(raw: str, backend: str = "") -> str:
+    """Filter KV store metrics to labeled kv_store_* families.
+
+    Dispatches to the right parser based on *backend*.
+    """
     if not raw.strip():
         return ""
+    if backend == "memcache":
+        return _filter_memcache_metrics(raw)
+    return _filter_mooncake_metrics(raw)
+
+
+def _emit_kv_store_prometheus(
+    cpu_usage: float,
+    cpu_total: float,
+    ssd_usage: float,
+    ssd_total: float,
+    keys: float,
+    eviction_success: float,
+    eviction_attempts: float,
+) -> str:
+    """Emit kv_store_* Prometheus text from pre-parsed backend values."""
+    out: list[str] = []
+    emitted_help: set[str] = set()
+    _emit_layer_size(out, emitted_help, "cpu", cpu_usage, cpu_total)
+    _emit_layer_size(out, emitted_help, "ssd", ssd_usage, ssd_total)
+    _emit_layer_size(out, emitted_help, "all", cpu_usage + ssd_usage, cpu_total + ssd_total)
+    _emit_layer_rate(out, emitted_help, "cpu", cpu_usage, cpu_total)
+    _emit_layer_rate(out, emitted_help, "ssd", ssd_usage, ssd_total)
+    _emit_layer_rate(out, emitted_help, "all", cpu_usage + ssd_usage, cpu_total + ssd_total)
+    _emit_labeled(out, emitted_help, "kv_store_keys", keys)
+    _emit_labeled(out, emitted_help, "kv_store_eviction", eviction_success, stat="success")
+    _emit_labeled(out, emitted_help, "kv_store_eviction", eviction_attempts, stat="attempts")
+    if not out:
+        return ""
+    return "\n".join(out) + "\n"
+
+
+def _filter_memcache_metrics(raw: str) -> str:
+    """Pass through memcache metrics with ``motor:memcache_`` prefix.
+
+    Also emits the summary ``kv_store_*`` families from capacity / keys /
+    eviction data.
+    """
+    labels_re = re.compile(r'\{(.+)\}')
+    pass_through: list[str] = []
+    usage: dict[str, float] = {}
+    total: dict[str, float] = {}
+    keys: float = 0.0
+    evictions: float = 0.0
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        # Pass through HELP / TYPE lines with renamed prefix
+        if stripped.startswith("# ") and "memcache_" in stripped:
+            pass_through.append(stripped.replace("memcache_", "motor:memcache_"))
+            continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        sample = _SAMPLE_VALUE_RE.match(stripped)
+        if not sample:
+            continue
+        name = sample.group(1)
+        val = float(sample.group(2))
+        label_str = labels_re.search(stripped)
+        labels = {}
+        if label_str:
+            labels = dict(_PROM_LABEL_RE.findall(label_str.group(1)))
+
+        # Aggregate for kv_store_* summary
+        if name == "memcache_total_capacity_bytes":
+            total[labels.get("medium", "dram")] = total.get(labels.get("medium", "dram"), 0.0) + val
+        elif name == "memcache_allocated_bytes":
+            usage[labels.get("medium", "dram")] = usage.get(labels.get("medium", "dram"), 0.0) + val
+        elif name == "memcache_stored_keys":
+            keys += val
+        elif name == "memcache_evict_operations_total":
+            evictions += val
+
+        # Pass through: rename memcache_ → motor:memcache_
+        new_name = name.replace("memcache_", "motor:memcache_", 1)
+        pass_through.append(stripped.replace(name, new_name, 1))
+
+    # Summary metrics + pass-through all in one output
+    out = _emit_kv_store_prometheus(
+        usage.get("dram", 0.0),
+        total.get("dram", 0.0),
+        0.0,
+        0.0,
+        keys,
+        evictions,
+        0.0,
+    )
+    if pass_through:
+        out += "\n".join(pass_through) + "\n"
+    return out
+
+
+def _filter_mooncake_metrics(raw: str) -> str:
+    """Parse Mooncake Master metrics (``master_*`` with allowlist)."""
     values: dict[str, float] = {}
     for line in raw.splitlines():
         stripped = line.strip()
@@ -118,47 +214,19 @@ def _filter_kvpool_metrics(raw: str) -> str:
         if not sample:
             continue
         old = sample.group(1)
-        if old not in _KVPOOL_METRIC_ALLOWLIST:
+        if old not in _KVSTORE_METRIC_ALLOWLIST:
             continue
         values[old] = values.get(old, 0.0) + float(sample.group(2))
 
-    out: list[str] = []
-    emitted_help: set[str] = set()
-    cpu_usage = values.get("master_allocated_bytes", 0.0)
-    cpu_total = values.get("master_total_capacity_bytes", 0.0)
-    ssd_usage = values.get("master_allocated_file_size_bytes", 0.0)
-    ssd_total = values.get("master_total_file_capacity_bytes", 0.0)
-
-    total_usage = cpu_usage + ssd_usage
-    total_cap = cpu_total + ssd_total
-
-    _emit_layer_size(out, emitted_help, "cpu", cpu_usage, cpu_total)
-    _emit_layer_size(out, emitted_help, "ssd", ssd_usage, ssd_total)
-    _emit_layer_size(out, emitted_help, "all", total_usage, total_cap)
-
-    _emit_layer_rate(out, emitted_help, "cpu", cpu_usage, cpu_total)
-    _emit_layer_rate(out, emitted_help, "ssd", ssd_usage, ssd_total)
-    _emit_layer_rate(out, emitted_help, "all", total_usage, total_cap)
-
-    _emit_labeled(out, emitted_help, "kv_pool_keys", values.get("master_key_count", 0.0))
-    _emit_labeled(
-        out,
-        emitted_help,
-        "kv_pool_eviction",
+    return _emit_kv_store_prometheus(
+        values.get("master_allocated_bytes", 0.0),
+        values.get("master_total_capacity_bytes", 0.0),
+        values.get("master_allocated_file_size_bytes", 0.0),
+        values.get("master_total_file_capacity_bytes", 0.0),
+        values.get("master_key_count", 0.0),
         values.get("master_successful_evictions_total", 0.0),
-        stat="success",
-    )
-    _emit_labeled(
-        out,
-        emitted_help,
-        "kv_pool_eviction",
         values.get("master_attempted_evictions_total", 0.0),
-        stat="attempts",
     )
-
-    if not out:
-        return ""
-    return "\n".join(out) + "\n"
 
 
 class MetricsCollector(ThreadSafeSingleton):
@@ -186,7 +254,7 @@ class MetricsCollector(ThreadSafeSingleton):
         self._serialize_lock = threading.Lock()
 
         self._lock = threading.Lock()
-        self._pool_metrics_text: str = ""
+        self._kv_store_metrics_text: str = ""
         self._stop_event = threading.Event()
         self._metrics_update_thread = None
         # Event loop for async get_all_instances (set from lifespan)
@@ -196,6 +264,8 @@ class MetricsCollector(ThreadSafeSingleton):
 
         self._aggregation_engine = SemanticAggregationEngine()
         self._motor_computer = MotorMetricComputer()
+        self._kv_store_disabled_logged = False
+        self._rl = RateLimitedLogger(logger)
 
         self._initialized = True
         logger.info("MetricsCollector initialized.")
@@ -285,7 +355,7 @@ class MetricsCollector(ThreadSafeSingleton):
             if "full" not in self._caches:
                 self._caches["full"] = self._generate_full_metrics(collects)
             metrics = self._caches["full"]
-        pool_text = self._pool_metrics_text
+        pool_text = self._kv_store_metrics_text
         if pool_text:
             if metrics and not metrics.endswith("\n"):
                 metrics += "\n"
@@ -437,37 +507,84 @@ class MetricsCollector(ThreadSafeSingleton):
         return result
 
     def _update_metrics_thread(self) -> None:
+        logger.info("Metrics update thread started")
         while not self._stop_event.is_set():
             collects = self._collect_metrics()
             if collects is not None:
                 with self._lock:
                     self._last_collects = collects
                     self._collects_version += 1
-            self._fetch_pool_metrics()
+            self._fetch_kv_store_metrics()
             with self._config_lock:
                 reuse_time = self._prometheus_metrics_config.reuse_time
             time.sleep(reuse_time)
 
-    def _fetch_pool_metrics(self) -> None:
+    def _fetch_kv_store_metrics(self) -> None:
+        """Fetch KV store pool metrics from the configured backend.
+
+        Enabled automatically when ``kv_cache_store_config`` is present in
+        ``user_config.json``.  Env vars serve as overrides for values that
+        only the deployer can provide (e.g. service hostname).
+        """
         with self._config_lock:
             cfg = self._prometheus_metrics_config
-            enabled = cfg.pool_metrics_enable
-            endpoint = cfg.pool_metrics_endpoint
-        if not enabled or not endpoint:
-            self._pool_metrics_text = ""
+
+        # --- determine endpoint ---
+        # 1. Explicit override
+        endpoint = cfg.kv_store_metrics_endpoint
+        # 2. Auto-construct from config (env overrides deployer-only values)
+        if not endpoint and cfg.kv_store_backend:
+            master = cfg.kv_store_service
+            if master:
+                port = str(cfg.kv_store_metrics_port)
+                if not port or port == "0":
+                    port = "50088" if cfg.kv_store_backend == "mooncake" else "50090"
+                endpoint = f"http://{master}:{port}/metrics"
+
+        # --- determine enabled ---
+        enabled = cfg.enable_kv_store_metrics or bool(cfg.kv_store_backend)
+
+        if not enabled:
+            self._kv_store_metrics_text = ""
+            # Log once when KV store metrics are not configured (no kv_cache_store_config)
+            if not self._kv_store_disabled_logged:
+                self._kv_store_disabled_logged = True
+                logger.info(
+                    "KV store metrics not enabled: backend=%r, explicit_enable=%s",
+                    cfg.kv_store_backend,
+                    cfg.enable_kv_store_metrics,
+                )
             return
+        if not endpoint:
+            self._rl.error_window(
+                "kv_store_metrics.no_endpoint",
+                "KV store metrics enabled but endpoint is empty (service unreachable)",
+                window_sec=120,
+                level="WARNING",
+            )
+            self._kv_store_metrics_text = ""
+            return
+        logger.debug("Fetching KV store metrics from %s", endpoint)
         try:
-            with urllib_request.urlopen(endpoint, timeout=5) as resp:
-                status_code = getattr(resp, "status", 200)
-                if status_code != 200:
-                    logger.warning("Pool metrics fetch got HTTP %s from %s", status_code, endpoint)
-                    self._pool_metrics_text = ""
-                    return
-                raw = resp.read().decode("utf-8", errors="replace")
-                self._pool_metrics_text = _filter_kvpool_metrics(raw)
-        except (URLError, TimeoutError, OSError) as e:
-            logger.warning("Pool metrics fetch %s failed: %s", endpoint, e)
-            self._pool_metrics_text = ""
+            resp = requests.get(endpoint, timeout=15)
+            if resp.status_code != 200:
+                self._rl.error_window(
+                    "kv_store_metrics.http_error",
+                    f"KV store metrics HTTP {resp.status_code} from {endpoint}",
+                    window_sec=60,
+                    level="WARNING",
+                )
+                self._kv_store_metrics_text = ""
+                return
+            self._kv_store_metrics_text = _filter_kvstore_metrics(resp.text, cfg.kv_store_backend)
+        except requests.RequestException as e:
+            self._rl.error_window(
+                "kv_store_metrics.fetch_failed",
+                f"KV store metrics fetch {endpoint} failed: {e}",
+                window_sec=60,
+                level="WARNING",
+            )
+            self._kv_store_metrics_text = ""
 
     def _collect_metrics(self) -> dict[int, dict[str, Any]] | None:
         available_instances, unavailable_instances = self._get_available_instances()
@@ -578,13 +695,21 @@ class MetricsCollector(ThreadSafeSingleton):
                     logger.error("[Metrics] Missing 'metrics_str' for endpoint in instance %s", instance_id)
                     return False
                 parsed_metric = self._parse_metric_text(metrics_str)
-                if not parsed_metric:
+                # None = structural parse failure; [] = parsed OK but no valid samples.
+                if parsed_metric is None:
                     logger.error("[Metrics] Parse metric text failed for instance %s", instance_id)
                     return False
                 pod_info[self.METRICS_KEY] = parsed_metric
         return True
 
-    def _parse_metric_text(self, metrics_str: str) -> list[Metric]:
+    def _parse_metric_text(self, metrics_str: str) -> list[Metric] | None:
+        """Parse Prometheus text into Metric families.
+
+        Returns:
+            list[Metric]: parse completed; may be empty when every family was
+                empty or dropped by per-line resilience.
+            None: structural failure (bad HELP/TYPE layout); caller must fail.
+        """
         lines = [ln for ln in metrics_str.splitlines() if ln.strip()]
         if not lines:
             return []
@@ -594,15 +719,42 @@ class MetricsCollector(ThreadSafeSingleton):
         while i < n:
             metric = Metric()
             if not self._parse_metric_help(metric, lines[i]):
-                return []
+                return None
             i += 1
             if i >= n or not self._parse_metric_type(metric, lines[i]):
-                return []
+                return None
             i += 1
+            sample_total = 0
+            sample_failed = 0
             while i < n and not lines[i].startswith("#"):
+                # A single bad body line is skipped so the rest of this instance's
+                # metrics still parse; the per-family summary below records the
+                # impact without taking down the full metrics text.
+                sample_total += 1
                 if not self._parse_metric_body_block(metric, lines[i]):
-                    return []
+                    sample_failed += 1
                 i += 1
+            if not metric.value:
+                if sample_total != 0:
+                    # Had samples but every line failed: drop the family instead of
+                    # emitting empty label/value arrays to downstream consumers.
+                    logger.error(
+                        "[Metrics] Drop metric %s: all %d sample line(s) failed to parse",
+                        metric.name,
+                        sample_total,
+                    )
+                    continue
+                # sample_total == 0: HELP/TYPE only (idle / just-started). Keep the
+                # family with empty samples; serializers emit an explicit 0.
+            elif sample_failed:
+                # One WARNING per family only; per-line detail is omitted to avoid
+                # spam when the same metric keeps emitting bad values each scrape.
+                logger.warning(
+                    "[Metrics] Metric %s: skipped %d of %d bad sample line(s)",
+                    metric.name,
+                    sample_failed,
+                    sample_total,
+                )
             metric_array.append(metric)
         return metric_array
 
@@ -641,22 +793,27 @@ class MetricsCollector(ThreadSafeSingleton):
         metric: Metric,
         line: str,
     ) -> bool:
+        # The value is always the last whitespace-separated token; rsplit once
+        # so label values containing spaces (e.g. name="prepare input") survive.
         parts = line.rsplit(None, 1)
         if len(parts) != 2:
-            logger.error("[Metrics] Parse metric body failed.")
             return False
 
-        label = cls._ENGINE_LABEL_RE.sub("", parts[0])
-        metric.label.append(label)
         try:
             value = float(parts[1])
-            if value < 0:
-                logger.error("[Metrics] Illegal metric value: %s", parts[1])
-                return False
-            metric.value.append(value)
         except ValueError:
-            logger.error("[Metrics] Illegal metric value: %s", parts[1])
             return False
+
+        # Only gauges may legitimately be negative; a negative counter/histogram
+        # is corrupt, so drop just this line rather than the whole metric text.
+        # Per-line logging is omitted; _parse_metric_text emits one family WARNING.
+        if value < 0 and metric.type != MetricType.GAUGE:
+            return False
+
+        # Append label and value together so the parallel arrays stay aligned.
+        label = cls._ENGINE_LABEL_RE.sub("", parts[0])
+        metric.label.append(label)
+        metric.value.append(value)
         return True
 
     def _fetch_instance_metrics(
@@ -852,6 +1009,10 @@ class MetricsCollector(ThreadSafeSingleton):
         for item in aggregate:
             lines.append("# HELP {} {}".format(item.name, item.help))
             lines.append("# TYPE {} {}".format(item.name, item.type))
+            if not item.label or not item.value:
+                # Keep zero-valued / empty-sample families visible on :1027/metrics.
+                lines.append("{} 0".format(item.name))
+                continue
             for i, label in enumerate(item.label):
                 v = item.value[i]
                 if math.isnan(v):
@@ -894,8 +1055,12 @@ class MetricsCollector(ThreadSafeSingleton):
             meta = name_to_meta[name]
             out_lines.append(f"# HELP {name} {meta['help']}")
             out_lines.append(f"# TYPE {name} {meta['type']}")
-            meta["lines"].sort(key=lambda kv: (kv[0], kv[1]))
-            out_lines.extend(line for _, line in meta["lines"])
+            if not meta["lines"]:
+                # No sample lines (idle / empty family): still expose an explicit 0.
+                out_lines.append(f"{name} 0")
+            else:
+                meta["lines"].sort(key=lambda kv: (kv[0], kv[1]))
+                out_lines.extend(line for _, line in meta["lines"])
         return "\n".join(out_lines)
 
     def _generate_dp_metrics(self, collects: dict[int, dict[str, Any]]) -> str:
@@ -914,6 +1079,10 @@ class MetricsCollector(ThreadSafeSingleton):
                         metric.name,
                         {"help": metric.help, "type": metric.type, "lines": []},
                     )
+                    if not metric.label or not metric.value:
+                        new_label = self._prepend_dim_labels(metric.name, dim_labels)
+                        meta["lines"].append(((instance_id, ep_id), f"{new_label} 0"))
+                        continue
                     for i, label_str in enumerate(metric.label):
                         new_label = self._prepend_dim_labels(label_str, dim_labels)
                         meta["lines"].append(
@@ -948,6 +1117,10 @@ class MetricsCollector(ThreadSafeSingleton):
                     metric.name,
                     {"help": metric.help, "type": metric.type, "lines": []},
                 )
+                if not metric.label or not metric.value:
+                    new_label = self._prepend_dim_labels(metric.name, dim_labels)
+                    meta["lines"].append(((pod_ip, role), f"{new_label} 0"))
+                    continue
                 for i, label_str in enumerate(metric.label):
                     new_label = self._prepend_dim_labels(label_str, dim_labels)
                     meta["lines"].append(((pod_ip, role), f"{new_label} {self._metric_value_str(metric.value[i])}"))

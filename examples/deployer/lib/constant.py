@@ -28,6 +28,7 @@ D_POD_NPU_NUM = "d_pod_npu_num"
 ASCEND_910_NPU_NUM = "huawei.com/Ascend910"
 ASCEND_950_NPU_NUM = "huawei.com/npu"
 RING_CONTROLLER_ATLAS_LABEL = "ring-controller.atlas"
+INFERSERVICE_ID_LABEL = "inferserviceid"
 HUAWEI_SCHEDULE_POLICY_ANNOTATION = "huawei.com/schedule_policy"
 A5_SCHEDULE_POLICY_BY_ACCELERATOR_TYPE = {
     "350-Atlas-8": "chip1-node8",
@@ -45,6 +46,10 @@ A5_HOST_PATH_VOLUMES = [
 HOST_NETWORK = "hostNetwork"
 DNS_POLICY = "dnsPolicy"
 DNS_POLICY_CLUSTER_FIRST_WITH_HOST_NET = "ClusterFirstWithHostNet"
+DNS_CONFIG = "dnsConfig"
+DNS_OPTIONS = "options"
+A5_DNS_NDOTS_OPTION = "ndots"
+A5_DNS_NDOTS_VALUE = "2"
 METADATA = "metadata"
 CONTROLLER = "controller"
 COORDINATOR = "coordinator"
@@ -77,17 +82,25 @@ COMMON_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "common.sh")
 CONTROLLER_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "roles/controller.sh")
 COORDINATOR_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "roles/coordinator.sh")
 ENGINE_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "roles/engine.sh")
-KV_POOL_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "roles/kv_pool.sh")
+KV_CACHE_STORE_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "roles/kv_cache_store.sh")
 MF_STORE_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "roles/mf_store.sh")
 SINGLE_CONTAINER_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "roles/all_combine_in_single_container.sh")
 MOTOR_COMMON_ENV = "motor_common_env"
 WEIGHT_MOUNT = "weight-mount"
-KV_CACHE_POOL_CONFIG = "kv_cache_pool_config"
-KV_POOL_PORT = "port"
-KV_POOL_EVICTION_HIGH_WATERMARK_RATIO = "eviction_high_watermark_ratio"
-KV_POOL_EVICTION_RATIO = "eviction_ratio"
+KV_CACHE_STORE_CONFIG = "kv_cache_store_config"
+KV_STORE_BACKEND = "backend"
+KV_CACHE_STORE_PORT = "port"
+KV_STORE_EVICTION_HIGH_WATERMARK_RATIO = "eviction_high_watermark_ratio"
+KV_STORE_EVICTION_RATIO = "eviction_ratio"
 DEFAULT_KV_LEASE_TTL = "default_kv_lease_ttl"
-DEFAULT_KV_POOL_PORT = 50088
+DEFAULT_KV_CACHE_STORE_PORT = 50088
+DEFAULT_KV_STORE_BACKEND = "memcache"
+MMC_STORE_BACKEND = "memcache"
+# memcache MetaService defaults
+MMC_CONFIG_STORE_PORT_KEY = "config_store_port"
+MMC_METRICS_PORT_KEY = "metrics_port"
+DEFAULT_MMC_CONFIG_STORE_PORT = 50089
+DEFAULT_MMC_METRICS_PORT = 50090
 KV_CONDUCTOR_CONFIG = "kv_conductor_config"
 KV_CONDUCTOR_PORT = "http_server_port"
 KV_CONDUCTOR_SHELL_PATH = os.path.join(STARTUP_ROOT_PATH, "roles/kv_conductor.sh")
@@ -163,7 +176,7 @@ ROLE_ENCODE = "encode"
 ROLE_PREFILL = "prefill"
 ROLE_DECODE = "decode"
 ROLE_UNION = "union"
-ROLE_KV_POOL = "kv-pool"
+ROLE_KV_STORE = "kv-store"
 ROLE_KV_CONDUCTOR = "kv-conductor"
 NODE_TYPE_E = "e"
 NODE_TYPE_P = "p"
@@ -179,12 +192,22 @@ ENV_CONTROLLER_SERVICE = "CONTROLLER_SERVICE"
 ENV_COORDINATOR_SERVICE = "COORDINATOR_SERVICE"
 ENV_COORDINATOR_INFER_SERVICE = "COORDINATOR_INFER_SERVICE"
 ENV_COORDINATOR_OBS_SERVICE = "COORDINATOR_OBS_SERVICE"
-ENV_KVP_MASTER_SERVICE = "KVP_MASTER_SERVICE"
+ENV_KVS_MASTER_SERVICE = "KVS_MASTER_SERVICE"
 ENV_KV_CONDUCTOR_SERVICE = "KV_CONDUCTOR_SERVICE"
-ENV_KV_POOL_PORT = "KV_POOL_PORT"
-ENV_KV_POOL_EVICTION_HIGH_WATERMARK_RATIO = "KV_POOL_EVICTION_HIGH_WATERMARK_RATIO"
-ENV_KV_POOL_EVICTION_RATIO = "KV_POOL_EVICTION_RATIO"
+ENV_KV_CACHE_STORE_PORT = "KV_CACHE_STORE_PORT"
+ENV_KV_STORE_EVICTION_HIGH_WATERMARK_RATIO = "KV_STORE_EVICTION_HIGH_WATERMARK_RATIO"
+ENV_KV_STORE_EVICTION_RATIO = "KV_STORE_EVICTION_RATIO"
 ENV_DEFAULT_KV_LEASE_TTL = "DEFAULT_KV_LEASE_TTL"
+ENV_KV_STORE_BACKEND = "KV_STORE_BACKEND"
+# memcache MetaService env vars
+ENV_MMC_CONFIG_STORE_URL = "MMC_CONFIG_STORE_URL"
+ENV_MMC_METRICS_URL = "MMC_METRICS_URL"
+ENV_MMC_LOCAL_CONFIG_PATH = "MMC_LOCAL_CONFIG_PATH"
+DEFAULT_MMC_LOCAL_CONFIG_PATH = "/usr/local/Ascend/pyMotor/conf/mmc-local.conf"
+ENV_MMC_LOCAL_SERVICE_MODE = "MMC_LOCAL_SERVICE_MODE"
+MMC_LOCAL_SERVICE_CONFIG_KEY = "local_service_mode"
+MMC_DRAM_SIZE_CONFIG_KEY = "dram_size"
+ENV_MMC_DRAM_SIZE = "MMC_DRAM_SIZE"
 ENV_DISAGGREGATION_BOOTSTRAP_PORT = "DISAGGREGATION_BOOTSTRAP_PORT"
 ENV_ASCEND_MF_STORE_URL = "ASCEND_MF_STORE_URL"
 ENV_ASCEND_MF_STORE_PORT = "ASCEND_MF_STORE_PORT"
@@ -215,6 +238,48 @@ TARGET_PORT = "targetPort"
 MOUNT_PATH = "mountPath"
 DEFAULT_WEIGHT_MOUNT_PATH = "/mnt/weight"
 JOB_NAME = "job-name"
+
+# Engine pod storage: a dynamically-provisioned PVC (motor_deploy_config.storage) mounted into
+# engine pods, plus an independent /dev/shm sizing knob (motor_deploy_config.dshm_size).
+# Used by UCM storage_backends but not UCM-specific.
+# k8s volume primitives
+PERSISTENT_VOLUME_CLAIM = "persistentVolumeClaim"
+CLAIM_NAME = "claimName"
+EMPTY_DIR = "emptyDir"
+SIZE_LIMIT = "sizeLimit"
+STORAGE_CLASS_NAME = "storageClassName"  # k8s PVC field
+ACCESS_MODES = "accessModes"  # k8s PVC field
+DSHM_VOLUME = "dshm"
+# motor_deploy_config.storage sub-keys. Each entry MUST declare a type:
+#   "pvc"      — a PVC: dynamically provisioned via storage_class_name, or an existing claim
+#                referenced by claim_name (mounted as-is; no PVC object is generated)
+#   "nfs"      — k8s-native NFS volume (server+path; no PVC / StorageClass required)
+#   "hostpath" — node-local hostPath (path; cross-node sharing only if that path is itself a
+#                shared mount, e.g. an identically-mounted NFS export, on every node)
+# Volume names (and generated-PVC names) are always auto-derived (mindie-motor-store-<i>) —
+# not user-configurable; claim_name entries mount the named existing claim instead.
+STORAGE = "storage"
+STORAGE_ENABLE = "enable"
+STORAGE_TYPE = "type"
+STORAGE_TYPE_PVC = "pvc"
+STORAGE_TYPE_NFS = "nfs"
+STORAGE_TYPE_HOSTPATH = "hostpath"
+STORAGE_CLASS = "storage_class_name"
+STORAGE_CLAIM_NAME = "claim_name"
+STORAGE_SIZE = "size"
+STORAGE_MOUNT_PATH = "mount_path"
+STORAGE_ACCESS_MODE = "access_mode"
+NFS_SERVER = "server"
+STORAGE_HOST_PATH_TYPE = "host_path_type"
+STORAGE_READ_ONLY = "read_only"
+K8S_READ_ONLY = "readOnly"
+# motor_deploy_config.dshm_size — independent /dev/shm emptyDir sizeLimit knob
+DSHM_SIZE = "dshm_size"
+# defaults (volume name == PVC name, auto-derived per entry index)
+DEFAULT_STORAGE_NAME = "mindie-motor-store"
+DEFAULT_STORAGE_MOUNT_PATH = "/mnt/store"
+DEFAULT_STORAGE_SIZE = "200Gi"
+DEFAULT_STORAGE_ACCESS_MODE = "ReadWriteMany"
 ROLES = "roles"
 SERVICES = "services"
 KIND_KEY = "kind"

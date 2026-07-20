@@ -20,6 +20,7 @@ from lib.utils import (
 )
 from lib.generator import k8s_utils
 from lib.generator.k8s_utils import set_engine_base_name, modify_sp_block_num
+from lib.generator.storage import apply_storage_volumes, apply_dshm_size
 
 
 def _pop_ring_controller_atlas_from_labels(labels):
@@ -58,15 +59,38 @@ def _append_a5_host_path_volumes(pod_spec, container):
             existing_mount_names.add(volume_name)
 
 
+def apply_a5_dns_config(pod_spec, deploy_config):
+    """Lower ndots so cluster FQDNs resolve directly without corporate search suffixes."""
+    hardware_type = deploy_config.get(C.HARDWARE_TYPE) if deploy_config else None
+    if hardware_type not in C.HARDWARE_TYPE_950I_A5:
+        return
+    pod_spec[C.DNS_CONFIG] = {C.DNS_OPTIONS: [{C.NAME: C.A5_DNS_NDOTS_OPTION, C.VALUE: C.A5_DNS_NDOTS_VALUE}]}
+    logger.info(
+        "Applied A5 dnsConfig %s=%s for hardware_type=%s",
+        C.A5_DNS_NDOTS_OPTION,
+        C.A5_DNS_NDOTS_VALUE,
+        hardware_type,
+    )
+
+
 def apply_a5_engine_pod_config(pod_spec, container, deploy_config):
     """Apply A5-specific pod network and hostPath settings to engine pods."""
     hardware_type = deploy_config.get(C.HARDWARE_TYPE) if deploy_config else None
     if hardware_type not in C.HARDWARE_TYPE_950I_A5:
         return
-    pod_spec[C.HOST_NETWORK] = True
-    pod_spec[C.DNS_POLICY] = C.DNS_POLICY_CLUSTER_FIRST_WITH_HOST_NET
     _append_a5_host_path_volumes(pod_spec, container)
+    apply_a5_dns_config(pod_spec, deploy_config)
     logger.info("Applied A5 engine pod config for hardware_type=%s", hardware_type)
+
+
+def _apply_a5_inferservice_id_label(template_metadata, deploy_config, hardware_type):
+    if hardware_type not in ("850-SuperPod-Atlas-8", "950-SuperPod-Atlas-8"):
+        return
+    job_id = deploy_config.get(C.CONFIG_JOB_ID) if deploy_config else None
+    if not job_id:
+        logger.warning("job_id is missing in deploy config, skip applying A5 label %s", C.INFERSERVICE_ID_LABEL)
+        return
+    template_metadata.setdefault(C.LABELS, {})[C.INFERSERVICE_ID_LABEL] = job_id
 
 
 def apply_a5_workload(workload, deploy_config):
@@ -81,6 +105,7 @@ def apply_a5_workload(workload, deploy_config):
         template_meta = workload.setdefault(C.METADATA, {})
     _pop_ring_controller_atlas_from_labels(template_meta.get(C.LABELS))
     _apply_a5_schedule_policy_annotation(template_meta, hardware_type)
+    _apply_a5_inferservice_id_label(template_meta, deploy_config, hardware_type)
 
 
 def update_engine_base_name(user_config):
@@ -96,7 +121,7 @@ def is_hybrid_deploy(deploy_config):
     return C.HYBRID_INSTANCES_NUM in deploy_config
 
 
-def build_engine_env_items(role, deploy_config, job_name, include_kv_pool=False):
+def build_engine_env_items(role, deploy_config, job_name, include_kv_store=False):
     env_items = [
         {C.NAME: C.ENV_ROLE, C.VALUE: role},
         {C.NAME: C.ENV_JOB_NAME, C.VALUE: job_name},
@@ -105,8 +130,8 @@ def build_engine_env_items(role, deploy_config, job_name, include_kv_pool=False)
         {C.NAME: C.ENV_COORDINATOR_INFER_SERVICE, C.VALUE: k8s_utils.g_coordinator_infer_service},
         {C.NAME: C.ENV_COORDINATOR_OBS_SERVICE, C.VALUE: k8s_utils.g_coordinator_obs_service},
     ]
-    if include_kv_pool and k8s_utils.g_kv_pool_enabled:
-        env_items.append({C.NAME: C.ENV_KVP_MASTER_SERVICE, C.VALUE: k8s_utils.g_kv_pool_service})
+    if include_kv_store and k8s_utils.g_kv_store_enabled:
+        env_items.extend(k8s_utils.build_kv_store_env_items())
     if k8s_utils.g_mf_store_enabled:
         ascend_mf_store_url = f"tcp://{k8s_utils.g_mf_store_service}:{C.DEFAULT_MF_STORE_PORT}"
         hardware_type = deploy_config.get(C.HARDWARE_TYPE, C.HARDWARE_TYPE_800I_A2)
@@ -140,7 +165,7 @@ def set_engine_env(container, deploy_config, node_type, job_name):
         role = role_map.get(node_type)
     if C.ENV not in container:
         container[C.ENV] = []
-    container[C.ENV].extend(build_engine_env_items(role, deploy_config, job_name, include_kv_pool=True))
+    container[C.ENV].extend(build_engine_env_items(role, deploy_config, job_name, include_kv_store=True))
 
 
 def set_engine_replicas(deployment_data, deploy_config, node_type):
@@ -185,13 +210,11 @@ def set_engine_npu(container, deploy_config, node_type):
 
 
 def apply_node_selector_by_hardware(pod_spec, hardware_type):
-    if hardware_type in C.HARDWARE_TYPE_A2:
-        pod_spec[C.NODE_SELECTOR][C.ACCELERATOR_TYPE] = C.ACCELERATOR_TYPE_910B
-    elif hardware_type in C.HARDWARE_TYPE_A3:
-        pod_spec[C.NODE_SELECTOR][C.ACCELERATOR_TYPE] = C.ACCELERATOR_TYPE_A3
-    elif hardware_type in C.HARDWARE_TYPE_950I_A5:
-        pod_spec[C.NODE_SELECTOR][C.ACCELERATOR_TYPE] = hardware_type
+    if hardware_type in C.HARDWARE_TYPE_A2 or hardware_type in C.HARDWARE_TYPE_A3:
+        pod_spec[C.NODE_SELECTOR][C.ACCELERATOR] = C.ACCELERATOR_910
+    if hardware_type in C.HARDWARE_TYPE_950I_A5:
         pod_spec[C.NODE_SELECTOR][C.ACCELERATOR] = C.ACCELERATOR_A5
+    pod_spec[C.NODE_SELECTOR][C.ACCELERATOR_TYPE] = k8s_utils.get_accelerator_type_from_cluster(hardware_type)
 
 
 def apply_pd_heterogeneous_node_selector(pod_spec, deploy_config, node_type):
@@ -275,7 +298,10 @@ def modify_engine_yaml(deployment_data, user_config, index, node_type):
     set_engine_npu(container, deploy_config, node_type)
     set_engine_node_selector(deployment_data, deploy_config, node_type)
     set_engine_weight_mount(deployment_data, container, deploy_config)
-    apply_a5_engine_pod_config(deployment_data[C.SPEC][C.TEMPLATE][C.SPEC], container, deploy_config)
+    engine_pod_spec = deployment_data[C.SPEC][C.TEMPLATE][C.SPEC]
+    apply_storage_volumes(engine_pod_spec, container, user_config)
+    apply_dshm_size(engine_pod_spec, user_config)
+    apply_a5_engine_pod_config(engine_pod_spec, container, deploy_config)
     apply_a5_workload(deployment_data, deploy_config)
     modify_log_mount(deployment_data, user_config, deployment_data[C.METADATA][C.NAME])
 

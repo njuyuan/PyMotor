@@ -147,6 +147,17 @@ setup_jemalloc() {
     fi
 }
 
+# Same physical node → same HCCL_LOGIC_SUPERPOD_ID (intra-node fabric OK);
+# different node names → different IDs (force inter-node RoCE).
+# Prefer NODE_NAME, then HOST_IP, then HOSTNAME. Do not hardcode in env.json.
+set_logic_superpod_id_per_node() {
+    local key="${NODE_NAME:-${HOST_IP:-${HOSTNAME:-unknown}}}"
+    local id
+    id=$(printf '%s' "${key}" | cksum | awk '{print $1 % 65536}')
+    export HCCL_LOGIC_SUPERPOD_ID="${id}"
+    echo "HCCL_LOGIC_SUPERPOD_ID=${HCCL_LOGIC_SUPERPOD_ID} (from ${key}; different node names → different IDs)"
+}
+
 USER_CONFIG_FILE="$CONFIGMAP_PATH/user_config.json"
 export USER_CONFIG_PATH="$USER_CONFIG_FILE"
 
@@ -167,6 +178,35 @@ sync_user_config() {
     else
         export USER_CONFIG_PATH="$USER_CONFIG_FILE"
     fi
+}
+
+sync_mmc_local_config() {
+    # ConfigMap files are symlinks; memcache rejects symlinks, so copy to a real file.
+    # dram.size, max.dram.size, and protocol are set at runtime by daemon.py.
+    local mmc_dst="$CONFIG_PATH/mmc-local.conf"
+
+    # Single unified template — protocol (rdma/sdma) chosen by Python daemon
+    local mmc_src="$CONFIGMAP_PATH/kv_store_backends.memcache.mmc-local.conf"
+
+    if [ ! -f "$mmc_src" ]; then
+        echo "Warning: mmc local config not found in ConfigMap ($mmc_src)"
+        return
+    fi
+
+    # Copy to real file (vLLM / in-process LocalService reads this)
+    if [ ! -f "$mmc_dst" ] || ! cmp -s "$mmc_src" "$mmc_dst"; then
+        cp -f "$mmc_src" "$mmc_dst"
+        chmod 640 "$mmc_dst"
+    fi
+    export MMC_LOCAL_CONFIG_PATH="$mmc_dst"
+
+    echo "MMC_LOCAL_CONFIG_PATH=$mmc_dst"
+
+    # Replace hardcoded DNS name with the actual K8s service FQDN
+    if [ -n "$KVS_MASTER_SERVICE" ]; then
+        sed -i "s|tcp://[^:]*:|tcp://${KVS_MASTER_SERVICE}:|g" "$mmc_dst"
+    fi
+
 }
 
 sync_user_config
@@ -194,9 +234,12 @@ else
 fi
 
 set_cann_env() {
-    export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] set_cann_env start"
+    local _start_ts=$(date +%s)
+    export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:/usr/local/lib"
     source "$CANN_INSTALL_PATH/ascend-toolkit/set_env.sh"
-    source "$CANN_INSTALL_PATH/nnal/atb/set_env.sh"
+    local _end_ts=$(date +%s)
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] set_cann_env done, elapsed=$((_end_ts - _start_ts))s"
 }
 
 _motor_deploy_hardware_type() {
@@ -227,29 +270,8 @@ is_a5_hardware() {
 }
 
 set_a5_engine_env() {
-    local if_name ip
-    if_name=$(awk '$2 == "00000000" {print $1; exit}' /proc/net/route)
-    ip="${HOST_IP:-$POD_IP}"
-
-    if [ -z "$if_name" ]; then
-        echo "Warning: failed to detect default route interface from /proc/net/route, skip GLOO/TP/HCCL socket ifname env" >&2
-        unset GLOO_SOCKET_IFNAME TP_SOCKET_IFNAME HCCL_SOCKET_IFNAME
-    else
-        export GLOO_SOCKET_IFNAME="$if_name"
-        export TP_SOCKET_IFNAME="$if_name"
-        export HCCL_SOCKET_IFNAME="$if_name"
-    fi
-
-    if [ -z "$ip" ]; then
-        echo "Warning: HOST_IP and POD_IP are both empty, skip HCCL_IF_IP env" >&2
-        unset HCCL_IF_IP
-    else
-        export HCCL_IF_IP="$ip"
-    fi
-
     export PATH="$PATH:/usr/local/go/bin"
-    export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
-    export ASCEND_LOCAL_COMM_RES_PATH="${ASCEND_LOCAL_COMM_RES_PATH:-/etc/hixlep}"
+    export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib64:/lib64:${LD_LIBRARY_PATH:-}"
 }
 
 gen_ranktable_config() {
@@ -268,13 +290,13 @@ gen_ranktable_config() {
     fi
 }
 
-gen_kv_pool_config() {
-    if [ -n "$KVP_MASTER_SERVICE" ]; then
+gen_kv_store_config() {
+    if [ -n "$KVS_MASTER_SERVICE" ]; then
         echo "Updating kv cache pool configuration file..."
-        export MOONCAKE_CONFIG_PATH=$CONFIG_PATH/kv_cache_pool_config.json
+        export MOONCAKE_CONFIG_PATH=$CONFIG_PATH/kv_cache_store_config.json
         export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake:$LD_LIBRARY_PATH
         if [ "$ROLE" = "SINGLE_CONTAINER" ]; then
-            KVP_MASTER_SERVICE=$POD_IP
+            KVS_MASTER_SERVICE=$POD_IP
         fi
         python3 "$CONFIGMAP_PATH/mooncake_config.py" pool "$MOONCAKE_CONFIG_PATH" "$USER_CONFIG_PATH"
     fi

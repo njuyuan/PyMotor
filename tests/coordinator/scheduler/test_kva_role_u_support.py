@@ -53,18 +53,12 @@ def test_register_post_uses_union_conductor_id_for_role_u() -> None:
     endpoint.ip = "10.0.0.1"
 
     mock_config = Mock()
-    # _kv_reg() — scheduler_config.kv_conductor_config: conductor addr, engine type, block size
-    mock_config.scheduler_config.kv_conductor_config.engine_type = "vLLM"
-    mock_config.scheduler_config.kv_conductor_config.block_size = 128
-    mock_config.scheduler_config.kv_conductor_config.conductor_service = "kv-conductor"
-    mock_config.scheduler_config.kv_conductor_config.http_server_port = 13333
-    mock_config.scheduler_config.kv_conductor_config.endpoint = "tcp://*:5557"
-    mock_config.scheduler_config.kv_conductor_config.xpu_endpoint = ""
-    mock_config.scheduler_config.kv_conductor_config.cpu_endpoint = ""
-    mock_config.scheduler_config.kv_conductor_config.disk_endpoint = ""
-    mock_config.scheduler_config.kv_conductor_config.replay_endpoint = ""
-    # _resolve_store_backend uses _kv_reg().store_backend
-    mock_config.scheduler_config.kv_conductor_config.store_backend = "Mooncake"
+    mock_config.prefill_kv_event_config.endpoint = "tcp://*:5557"
+    mock_config.prefill_kv_event_config.replay_endpoint = ""
+    mock_config.prefill_kv_event_config.engine_type = "vLLM"
+    mock_config.prefill_kv_event_config.block_size = 128
+    mock_config.prefill_kv_event_config.conductor_service = "kv-conductor"
+    mock_config.prefill_kv_event_config.http_server_port = 13333
 
     with (
         patch.object(ConductorApiClient, "coordinator_config", mock_config),
@@ -86,18 +80,12 @@ def test_register_post_formats_ipv6_endpoint_and_conductor_address() -> None:
     endpoint.ip = "2001:db8::1"
 
     mock_config = Mock()
-    # _kv_reg() — scheduler_config.kv_conductor_config: conductor addr, engine type, block size, endpoint patterns
-    mock_config.scheduler_config.kv_conductor_config.engine_type = "vLLM"
-    mock_config.scheduler_config.kv_conductor_config.block_size = 128
-    mock_config.scheduler_config.kv_conductor_config.model_path = ""
-    mock_config.scheduler_config.kv_conductor_config.conductor_service = "2001:db8::10"
-    mock_config.scheduler_config.kv_conductor_config.http_server_port = 13333
-    mock_config.scheduler_config.kv_conductor_config.xpu_endpoint = ""
-    mock_config.scheduler_config.kv_conductor_config.cpu_endpoint = ""
-    mock_config.scheduler_config.kv_conductor_config.disk_endpoint = ""
-    mock_config.scheduler_config.kv_conductor_config.endpoint = "tcp://*:5557"
-    mock_config.scheduler_config.kv_conductor_config.replay_endpoint = "tcp://*:6667"
-    mock_config.scheduler_config.kv_conductor_config.store_backend = "Mooncake"
+    mock_config.prefill_kv_event_config.endpoint = "tcp://*:5557"
+    mock_config.prefill_kv_event_config.replay_endpoint = "tcp://*:6667"
+    mock_config.prefill_kv_event_config.engine_type = "vLLM"
+    mock_config.prefill_kv_event_config.block_size = 128
+    mock_config.prefill_kv_event_config.conductor_service = "2001:db8::10"
+    mock_config.prefill_kv_event_config.http_server_port = 13333
 
     with (
         patch.object(ConductorApiClient, "coordinator_config", mock_config),
@@ -109,9 +97,7 @@ def test_register_post_formats_ipv6_endpoint_and_conductor_address() -> None:
     mock_http_client.assert_called_once()
     assert mock_http_client.call_args.kwargs["address"] == "[2001:db8::10]:13333"
     register_payload = mock_http_client.return_value.__enter__.return_value.post.call_args[0][1]
-    # Endpoints are now wrapped in medium_endpoints dict (xpu/cpu/disk).
-    # When per-medium fields are empty, all fall back to the legacy "endpoint".
-    assert register_payload["medium_endpoints"]["xpu"] == "tcp://[2001:db8::1]:5559"
+    assert register_payload["endpoint"] == "tcp://[2001:db8::1]:5559"
     assert register_payload["replay_endpoint"] == "tcp://[2001:db8::1]:6669"
 
 
@@ -121,20 +107,11 @@ def test_register_kv_instance_supports_role_u() -> None:
         _build_instance(PDRole.ROLE_U),
         _build_instance(PDRole.ROLE_D),
     ]
-    with (
-        patch.object(ConductorApiClient, "_register_hbm_dp") as mock_hbm_dp,
-        patch.object(ConductorApiClient, "_register_yuanrong_dp") as mock_yuanrong_dp,
-        patch.object(ConductorApiClient, "_register_pool"),
-    ):
+    with patch.object(ConductorApiClient, "register_post") as mock_register_post:
         ConductorApiClient.register_kv_instance(instances)
 
-    # Depending on backend mode, either _register_hbm_dp or _register_yuanrong_dp
-    # is called for each KVA-eligible instance endpoint.
-    # Signature: _register_*_dp(cls, reg, store_backend, instance, endpoint)
-    # call.args excludes cls, so instance is at index 2.
-    registered_method = mock_hbm_dp if mock_hbm_dp.call_count else mock_yuanrong_dp
-    assert registered_method.call_count == 2
-    called_roles = {call.args[2].role for call in registered_method.call_args_list}
+    assert mock_register_post.call_count == 2
+    called_roles = {call.args[0].role for call in mock_register_post.call_args_list}
     assert called_roles == {PDRole.ROLE_P, PDRole.ROLE_U}
 
 

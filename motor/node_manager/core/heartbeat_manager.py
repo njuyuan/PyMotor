@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -18,6 +16,7 @@ import socket
 from motor.common.resources.endpoint import Endpoint, EndpointStatus
 from motor.common.resources.http_msg_spec import StartCmdMsg, HeartbeatMsg
 from motor.common.logger import get_logger
+from motor.common.logger.rate_limited_logger import RateLimitedLogger
 from motor.common.utils.net import format_address
 from motor.common.utils.singleton import ThreadSafeSingleton
 from motor.common.utils.snapshot_utils import is_restored_from_host_side_snapshot, RETRY_LOG_FREQUENCY
@@ -29,6 +28,7 @@ from motor.node_manager.core.daemon import Daemon
 
 
 logger = get_logger(__name__)
+_rl = RateLimitedLogger(logger)
 
 
 class HeartbeatManager(ThreadSafeSingleton):
@@ -109,6 +109,9 @@ class HeartbeatManager(ThreadSafeSingleton):
         # Reset suicide flag when endpoints are updated
         with self._suicide_lock:
             self._should_suicide = False
+        self._is_within_grace_period = True
+        if self._thread_started:
+            self._engine_status_thread_start_time = time.time()
 
     def should_suicide(self) -> bool:
         """
@@ -361,7 +364,11 @@ class HeartbeatManager(ThreadSafeSingleton):
                         self._reregister()
                 else:
                     with self.config_lock:
-                        logger.error("Exception occurred while reporting endpoint status to controller: %s", e)
+                        _rl.error_window(
+                            "heartbeat.report_error",
+                            "Exception occurred while reporting endpoint status to controller: %s" % e,
+                            window_sec=60,
+                        )
 
             # Update consecutive abnormal count after successful heartbeat report
             with self._abnormal_count_lock:
@@ -394,7 +401,7 @@ class HeartbeatManager(ThreadSafeSingleton):
         # Register for post-snapshot brandnew job name
         # Do not consider retry
         # If current register failed, next register will be triggered by next heartbeat report exception
-        ret = EngineManager().post_register_msg_after_restore()
+        ret = EngineManager().post_register_msg()
         self._is_registered_after_restore = ret is True
 
     def _reregister(self) -> None:

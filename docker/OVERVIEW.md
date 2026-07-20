@@ -98,7 +98,7 @@ Each Dockerfile header comment contains the exact `--platform` value, source rep
 The build process:
 
 1. Pulls the matching vllm-ascend base image.
-2. Clones the pinned MindIE-PyMotor source into `/opt/MindIE-PyMotor`.
+2. Clones the pinned MindIE Motor source into `/opt/MindIE-PyMotor`.
 3. Installs dependencies, compiles, and installs the `motor` wheel.
 4. Builds and installs the `ccae_reporter` observability component.
 5. Generates the entrypoint script and license agreement inline within the Dockerfile.

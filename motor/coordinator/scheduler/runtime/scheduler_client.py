@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -15,8 +14,10 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Awaitable, Callable
 
+import msgspec
 import zmq
 
 from motor.common.resources.dispatch import (
@@ -35,6 +36,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     SchedulerRequestType,
     SchedulerResponseType,
     INSTANCE_CHANGE_TOPIC,
+    CIRCUIT_BREAKER_TOPIC,
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
@@ -70,12 +72,27 @@ OnInstanceRefreshedCallback = Callable[[list[tuple[str, str]]], Awaitable[None]]
 _AFFINITY_CANDIDATE_TOPK = 3
 
 
+class SchedulerRequestFailureReason(str, Enum):
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    DISCONNECTED = "disconnected"
+    TRANSPORT_ERROR = "transport_error"
+    NO_RESPONSE = "no_response"
+
+
+@dataclass(frozen=True)
+class SchedulerRequestResult:
+    response: SchedulerResponse | None = None
+    failure_reason: SchedulerRequestFailureReason | None = None
+    error: str | None = None
+
+
 def _collect_active_endpoints_from_cache(
     cache: "_SchedulerInstanceCache",
 ) -> list[tuple[str, str]]:
     """
     Extract status=normal (ip, business_port) from SchedulerInstanceCache.
-    Filter logic aligned with BaseRouter._select_endpoint_from_instance.
+    Keeps endpoints whose status is normal.
     """
     endpoints: list[tuple[str, str]] = []
     for role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
@@ -186,6 +203,72 @@ class _SchedulerInstanceCache:
                     for ep in (pod_eps or {}).values():
                         self._endpoint_map[(inst.id, ep.id)] = ep
 
+    @staticmethod
+    def _role_of(inst: Instance) -> PDRole | None:
+        role = getattr(inst, "role", None)
+        if isinstance(role, PDRole):
+            return role
+        if role is None:
+            return None
+        normalized_role = str(role).strip().lower()
+        # "hybrid" predates PDRole.ROLE_U ("union").  The enum itself handles
+        # all canonical roles and the historical "both" alias, including future
+        # values added to PDRole.
+        if normalized_role == "hybrid":
+            return PDRole.ROLE_U
+        try:
+            return PDRole(normalized_role)
+        except ValueError:
+            return None
+
+    async def apply_add(self, instances: list[Instance]) -> bool:
+        """Incrementally upsert instances (from a PUB ADD delta), keeping each role list sorted by
+        id, so a worker patches its cache on a topology change without a full GET round-trip. An
+        ADD may also update an existing instance, so remove its prior role and endpoint entries
+        before inserting the replacement. Returns False without mutation when a role is unknown,
+        so the caller can fall back to a full refresh instead of accepting an incomplete delta.
+        """
+        resolved_instances = [(inst, self._role_of(inst)) for inst in instances]
+        unknown_instances = [inst for inst, role in resolved_instances if role is None]
+        if unknown_instances:
+            logger.warning(
+                "Rejecting instance ADD delta with unknown role(s); falling back to full refresh: %s",
+                [(getattr(inst, "id", None), getattr(inst, "role", None)) for inst in unknown_instances],
+            )
+            return False
+        async with self._lock:
+            for inst, role in resolved_instances:
+                for existing_role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
+                    role_map = self._instance_map.get(existing_role)
+                    if role_map and inst.id in role_map:
+                        del role_map[inst.id]
+                        self._instance_cache[existing_role] = sorted(role_map.values(), key=lambda i: i.id)
+                for key in [key for key in self._endpoint_map if key[0] == inst.id]:
+                    del self._endpoint_map[key]
+                role_map = self._instance_map.setdefault(role, {})
+                role_map[inst.id] = inst
+                self._instance_cache[role] = sorted(role_map.values(), key=lambda i: i.id)
+                if inst.endpoints:
+                    for pod_eps in (inst.endpoints or {}).values():
+                        for ep in (pod_eps or {}).values():
+                            self._endpoint_map[(inst.id, ep.id)] = ep
+        return True
+
+    async def apply_remove(self, instances: list[Instance]) -> None:
+        """Incrementally drop instances (from a PUB DEL delta) from every role list and the endpoint
+        map. Role is searched across all pools so a stale role on the delta cannot orphan an entry.
+        """
+        async with self._lock:
+            for inst in instances:
+                iid = inst.id
+                for role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
+                    role_map = self._instance_map.get(role)
+                    if role_map and iid in role_map:
+                        del role_map[iid]
+                        self._instance_cache[role] = sorted(role_map.values(), key=lambda i: i.id)
+                for key in [k for k in self._endpoint_map if k[0] == iid]:
+                    del self._endpoint_map[key]
+
 
 class _SchedulerTransport:
     def __init__(
@@ -206,8 +289,6 @@ class _SchedulerTransport:
         self._pending_requests: dict[str, tuple[asyncio.Event | None, float] | None] = {}
         self._pending_responses: dict[str, SchedulerResponse] = {}
         self._request_lock = asyncio.Lock()
-        self._encode_lock = asyncio.Lock()
-        self._decode_lock = asyncio.Lock()
         self._receive_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -240,9 +321,13 @@ class _SchedulerTransport:
         await self._close_connection()
 
     async def send_request(self, request: SchedulerRequest) -> SchedulerResponse | None:
+        result = await self.send_request_result(request)
+        return result.response
+
+    async def send_request_result(self, request: SchedulerRequest) -> SchedulerRequestResult:
         if not self.connected or not self._socket:
             logger.error("Scheduler transport not connected")
-            return None
+            return SchedulerRequestResult(failure_reason=SchedulerRequestFailureReason.DISCONNECTED)
         event = asyncio.Event()
         request_timestamp = time.time()
         async with self._request_lock:
@@ -254,8 +339,9 @@ class _SchedulerTransport:
             log_req_id,
         )
         try:
-            async with self._encode_lock:
-                serialized = self._serializer.serialize_request(request)
+            # serialize_request is synchronous (msgspec, no await), so the single event loop already
+            # runs it atomically; a lock around no-await code is never contended. Same for decode below.
+            serialized = self._serializer.serialize_request(request)
             await self._socket.send_multipart(pack_send_frames([b""], serialized))
             try:
                 await asyncio.wait_for(event.wait(), timeout=self._timeout)
@@ -273,7 +359,7 @@ class _SchedulerTransport:
                             None,
                             request_timestamp,
                         )
-                return None
+                return SchedulerRequestResult(failure_reason=SchedulerRequestFailureReason.TIMEOUT)
             async with self._request_lock:
                 pending_info = self._pending_requests.get(request.request_id)
                 if pending_info:
@@ -295,7 +381,9 @@ class _SchedulerTransport:
                     log_req_id,
                     elapsed_ms,
                 )
-                return response
+                if response is None:
+                    return SchedulerRequestResult(failure_reason=SchedulerRequestFailureReason.NO_RESPONSE)
+                return SchedulerRequestResult(response=response)
         except asyncio.CancelledError:
             logger.warning(
                 "Scheduler request cancelled request_type=%s req_id=%s",
@@ -305,7 +393,7 @@ class _SchedulerTransport:
             async with self._request_lock:
                 self._pending_requests.pop(request.request_id, None)
                 self._pending_responses.pop(request.request_id, None)
-            return None
+            return SchedulerRequestResult(failure_reason=SchedulerRequestFailureReason.CANCELLED)
         except Exception as e:
             elapsed_ms = (time.time() - request_timestamp) * 1000
             logger.error(
@@ -319,7 +407,12 @@ class _SchedulerTransport:
             async with self._request_lock:
                 self._pending_requests.pop(request.request_id, None)
                 self._pending_responses.pop(request.request_id, None)
-            return None
+            reason = (
+                SchedulerRequestFailureReason.DISCONNECTED
+                if isinstance(e, zmq.ZMQError) or not self.connected or not self._socket
+                else SchedulerRequestFailureReason.TRANSPORT_ERROR
+            )
+            return SchedulerRequestResult(failure_reason=reason, error=str(e))
 
     async def _close_connection(self) -> None:
         async with self._connect_lock:
@@ -348,8 +441,8 @@ class _SchedulerTransport:
                     )
                     if len(parts) < 2:
                         continue
-                    async with self._decode_lock:
-                        response = self._serializer.deserialize_response(unpack_recv_payload(parts))
+                    # deserialize_response is synchronous; no decode lock needed (see send path).
+                    response = self._serializer.deserialize_response(unpack_recv_payload(parts))
                     async with self._request_lock:
                         pending_info = self._pending_requests.get(response.request_id)
                         if pending_info is None:
@@ -381,8 +474,13 @@ class _SchedulerTransport:
                 logger.error("Scheduler transport receive loop error: %s", e, exc_info=True)
 
 
-# Callback when instance list change is received from Scheduler PUB; arg: instance_version (int | None)
-OnInstanceChangeNotify = Callable[[int | None], Awaitable[None]]
+# Callback when instance list change is received from Scheduler PUB; args: instance_version, optional
+# incremental delta ({"event": "add"|"del", "instances": [...]}) or None for version-only messages.
+OnInstanceChangeNotify = Callable[[int | None, dict | None], Awaitable[None]]
+
+# Callback when circuit breaker state change is received from Scheduler PUB
+OnCircuitBreakerChangeNotify = Callable[[int, str], Awaitable[None]]
+# args: instance_id, state ("open"|"closed")
 
 # ZMQ PUB does not queue; SUB must be ready before PUB sends. Short delay after connect.
 _INSTANCE_PUB_SUB_SETTLE_MS = 150
@@ -402,9 +500,11 @@ class _InstancePushSubscriber:
         self,
         sub_address: str,
         on_instance_change: OnInstanceChangeNotify,
+        on_circuit_breaker_change: OnCircuitBreakerChangeNotify | None = None,
     ) -> None:
         self._sub_address = sub_address
         self._on_instance_change = on_instance_change
+        self._on_circuit_breaker_change = on_circuit_breaker_change
         self._context: zmq.asyncio.Context | None = None
         self._socket: zmq.asyncio.Socket | None = None
         self._stop_event = asyncio.Event()
@@ -461,7 +561,15 @@ class _InstancePushSubscriber:
                     topic = frames[0] if frames else b""
                     if topic == INSTANCE_CHANGE_TOPIC:
                         version = self._parse_int_frame(frames, 1)
-                        await self._on_instance_change(version)
+                        delta = self._parse_msgpack_frame(frames, 2)
+                        await self._on_instance_change(version, delta)
+                    elif topic == CIRCUIT_BREAKER_TOPIC and self._on_circuit_breaker_change:
+                        payload = self._parse_msgpack_frame(frames, 1)
+                        if payload and isinstance(payload, dict):
+                            await self._on_circuit_breaker_change(
+                                int(payload.get("instance_id", 0)),
+                                str(payload.get("state", "")),
+                            )
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -481,6 +589,16 @@ class _InstancePushSubscriber:
         try:
             return int(frames[index].decode())
         except (ValueError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _parse_msgpack_frame(frames: list[bytes], index: int) -> dict | None:
+        """Parse msgpack-encoded dict from a multipart frame."""
+        if len(frames) <= index:
+            return None
+        try:
+            return msgspec.msgpack.decode(frames[index])
+        except Exception:
             return None
 
 
@@ -521,6 +639,13 @@ class AsyncSchedulerClient:
         self.timeout = config.timeout
         self._client_index = max(0, config.client_index)
         self._client_count = max(1, config.client_count)
+        # Per-request ids: one-time full-uuid prefix + monotonic counter, avoiding a uuid4() per call.
+        # Correctness only needs client-local uniqueness -- the transport matches replies in its own
+        # _pending_requests dict keyed by request_id, on its own DEALER socket; the scheduler only
+        # echoes it back. The full 128-bit prefix keeps ids effectively globally unique anyway, so
+        # cross-process log/trace correlation stays unambiguous.
+        self._request_id_prefix = uuid.uuid4().hex
+        self._request_seq = 0
         self._endpoint_instance_score_weight = max(0.0, config.endpoint_instance_score_weight)
         mode = str(config.kv_affinity_mode or KV_AFFINITY_MODE_UNIFIED).lower()
         if mode not in KV_AFFINITY_MODES:
@@ -546,12 +671,14 @@ class AsyncSchedulerClient:
         self._workload_reader = None
         self._last_instance_version: int | None = None
         self._on_instance_refreshed = config.on_instance_refreshed
+        self._cb_blocked_instances: set[int] = set()
 
         instance_pub = (config.instance_pub_address or "").strip()
         self._push_subscriber = (
             _InstancePushSubscriber(
                 instance_pub,
                 self._on_instance_change_notify,
+                self._on_circuit_breaker_change,
             )
             if instance_pub
             else None
@@ -590,13 +717,18 @@ class AsyncSchedulerClient:
             # Always close transport so ZMQ context is terminated even if above steps raise.
             await self._transport.disconnect()
 
-    async def select_instance_and_endpoint(self, req_info: RequestInfo, role: PDRole | None = None):
-        """Select instance and endpoint from cache or GET_AVAILABLE_INSTANCES. Returns (Instance, Endpoint) or None."""
-        candidates = await self._select_endpoint_candidates(req_info, role, top_k=1)
-        if not candidates:
-            return None
-        instance, endpoint, _ = candidates[0]
-        return (instance, endpoint)
+    async def _send_request_result(self, request: SchedulerRequest) -> SchedulerRequestResult:
+        if hasattr(type(self._transport), "send_request_result"):
+            return await self._transport.send_request_result(request)
+        response = await self._transport.send_request(request)
+        if response is None:
+            return SchedulerRequestResult(failure_reason=SchedulerRequestFailureReason.NO_RESPONSE)
+        return SchedulerRequestResult(response=response)
+
+    def _next_request_id(self) -> str:
+        """Cheap monotonic request id (client-local uniqueness is all the transport needs)."""
+        self._request_seq += 1
+        return f"{self._request_id_prefix}-{self._request_seq}"
 
     async def _select_endpoint_candidates(
         self,
@@ -647,7 +779,7 @@ class AsyncSchedulerClient:
             )
         return candidates, candidate_policy
 
-    async def _refresh_cache_from_workload_reader(self) -> None:
+    async def _refresh_cache_from_workload_reader(self, role: PDRole | None = None) -> None:
         """Patch live workload into the local cache and pull a fresh instance list on
         heartbeat-stale or instance-version change.
 
@@ -656,7 +788,7 @@ class AsyncSchedulerClient:
         """
         if not self._workload_reader:
             return
-        current_version, heartbeat_stale = self._workload_reader.read_and_patch_cache(self._cache)
+        current_version, heartbeat_stale = self._workload_reader.read_and_patch_cache(self._cache, role=role)
         if heartbeat_stale:
             await self._pull_instances_and_notify(current_version, "stale heartbeat")
         elif current_version is not None:
@@ -673,13 +805,22 @@ class AsyncSchedulerClient:
             logger.warning("Failed to refresh instances on %s: %s", reason, e)
             return
         self._last_instance_version = current_version
-        if self._on_instance_refreshed:
-            active_endpoints = _collect_active_endpoints_from_cache(self._cache)
-            if active_endpoints:
-                try:
-                    await self._on_instance_refreshed(active_endpoints)
-                except Exception as e:
-                    logger.warning("on_instance_refreshed callback failed: %s", e)
+        await self._notify_instance_refreshed()
+
+    async def _notify_instance_refreshed(self) -> None:
+        """Fire the instance-refresh callback with the current active endpoints.
+
+        Always fires when a callback is registered -- an empty list is meaningful: a full drain
+        must still notify downstream (e.g. so the HTTP client pool prunes clients for endpoints that
+        went away) instead of leaking them until the next non-empty refresh.
+        """
+        if not self._on_instance_refreshed:
+            return
+        active_endpoints = _collect_active_endpoints_from_cache(self._cache)
+        try:
+            await self._on_instance_refreshed(active_endpoints)
+        except Exception as e:
+            logger.warning("on_instance_refreshed callback failed: %s", e)
 
     async def select_and_allocate(
         self,
@@ -691,7 +832,7 @@ class AsyncSchedulerClient:
         """Select instance locally + ALLOCATE_ONLY RPC. Allocation workload is decided here (RR=zero, LB=demand)."""
         role_str = role.value if role is not None else (getattr(PDRole.ROLE_U, "value", "union"))
 
-        await self._refresh_cache_from_workload_reader()
+        await self._refresh_cache_from_workload_reader(role)
 
         # Set in the kv_cache_affinity unified branch below: forward every endpoint's
         # affinity-discounted prefill cost so the scheduler re-ranks globally by fresh load.
@@ -712,6 +853,7 @@ class AsyncSchedulerClient:
                 instance,
                 scheduler_type=self._scheduler_type or "round_robin",
                 endpoint_rr_counters=self._endpoint_rr_counters,
+                is_blocked=self.is_instance_blocked,
             )
             if endpoint is None:
                 logger.warning(
@@ -777,8 +919,11 @@ class AsyncSchedulerClient:
             else calculate_demand_workload(role, req_info)
         )
 
-        request_id = str(uuid.uuid4())
+        request_id = self._next_request_id()
         workload_sequence = self._workload_reader.last_sequence if self._workload_reader is not None else None
+        role_workload_sequence = (
+            self._workload_reader.last_sequence_for_role(role) if self._workload_reader is not None else None
+        )
         req_data = {
             "instance_id": instance.id,
             "endpoint_id": endpoint.id,
@@ -786,8 +931,12 @@ class AsyncSchedulerClient:
             "role": role_str,
             "req_id": req_info.req_id,
             "workload_sequence": workload_sequence,
+            "role_workload_sequence": role_workload_sequence,
             "instance_version": self._last_instance_version,
-            "workload": workload.model_dump(mode="json"),
+            # Workload demand as two raw floats: avoids a pydantic dump here and a model_validate on
+            # the scheduler. RR sends 0.0/0.0 (Workload() has no demand) rather than a dumped model.
+            "workload_active_tokens": workload.active_tokens,
+            "workload_active_kv_cache": workload.active_kv_cache,
             "candidate_policy": candidate_policy,
         }
         if global_affinity:
@@ -869,7 +1018,7 @@ class AsyncSchedulerClient:
         if not self._transport.connected:
             logger.warning("confirm_sample: scheduler transport not connected")
             return False
-        request_id = str(uuid.uuid4())
+        request_id = self._next_request_id()
         request = SchedulerRequest(
             request_type=SchedulerRequestType.CONFIRM_SAMPLE,
             request_id=request_id,
@@ -898,7 +1047,7 @@ class AsyncSchedulerClient:
         if not self._transport.connected:
             logger.warning("record_precision_result: scheduler transport not connected")
             return None
-        request_id = str(uuid.uuid4())
+        request_id = self._next_request_id()
         request = SchedulerRequest(
             request_type=SchedulerRequestType.RECORD_PRECISION_RESULT,
             request_id=request_id,
@@ -936,7 +1085,7 @@ class AsyncSchedulerClient:
         if not self._transport.connected:
             logger.warning("finish_precision_action: scheduler transport not connected")
             return False
-        request_id = str(uuid.uuid4())
+        request_id = self._next_request_id()
         request = SchedulerRequest(
             request_type=SchedulerRequestType.FINISH_PRECISION_ACTION,
             request_id=request_id,
@@ -961,7 +1110,7 @@ class AsyncSchedulerClient:
 
     async def update_workload(self, params: UpdateWorkloadParams) -> bool:
         role_str = params.role.value if hasattr(params.role, "value") else str(params.role)
-        request_id = str(uuid.uuid4())
+        request_id = self._next_request_id()
         request = SchedulerRequest(
             request_type=SchedulerRequestType.UPDATE_WORKLOAD,
             request_id=request_id,
@@ -972,10 +1121,12 @@ class AsyncSchedulerClient:
                 "req_id": params.req_id,
                 "workload_action": params.workload_action.value,
                 "workload_change": params.workload_change,
+                "operation_id": params.operation_id,
             },
         )
 
-        response = await self._transport.send_request(request)
+        result = await self._send_request_result(request)
+        response = result.response
 
         if response and response.response_type == SchedulerResponseType.SUCCESS:
             success = (response.data or {}).get("success", False)
@@ -1002,17 +1153,20 @@ class AsyncSchedulerClient:
             )
         else:
             logger.error(
-                "Update workload got no response (timeout or connection): "
-                "instance_id=%s endpoint_id=%s role=%s req_id=%s",
+                "Update workload got no response reason=%s error=%s: "
+                "instance_id=%s endpoint_id=%s role=%s req_id=%s action=%s",
+                (result.failure_reason or SchedulerRequestFailureReason.NO_RESPONSE).value,
+                result.error,
                 params.instance_id,
                 params.endpoint_id,
                 role_str,
                 params.req_id,
+                params.workload_action.value,
             )
         return False
 
     async def get_available_instances(self, role: PDRole | None = None) -> dict[int, Instance]:
-        request_id = str(uuid.uuid4())
+        request_id = self._next_request_id()
         request = SchedulerRequest(
             request_type=SchedulerRequestType.GET_AVAILABLE_INSTANCES,
             request_id=request_id,
@@ -1126,6 +1280,17 @@ class AsyncSchedulerClient:
             decode = self._cache.get_instances(PDRole.ROLE_D)
         return has_compatible_dispatch_pair(prefill, decode)
 
+    async def get_unblocked_instances(self, role: PDRole) -> list[int]:
+        """Return instance IDs of the given role that are NOT blocked by circuit breaker."""
+        cached = self._cache.get_instances(role)
+        if not cached:
+            try:
+                await self.get_available_instances(None)
+            except Exception as e:
+                logger.debug("get_unblocked_instances: warm-up fetch failed: %s", e)
+            cached = self._cache.get_instances(role)
+        return [inst.id for inst in cached if inst.id not in self._cb_blocked_instances]
+
     async def has_required_instances(self) -> InstanceReadiness:
         """Return InstanceReadiness from cache; warm-up fetch if needed."""
 
@@ -1157,7 +1322,7 @@ class AsyncSchedulerClient:
         return {}, {}
 
     async def refresh_instances(self, event_type, instances: list[Instance]) -> None:
-        request_id = str(uuid.uuid4())
+        request_id = self._next_request_id()
         request = SchedulerRequest(
             request_type=SchedulerRequestType.REFRESH_INSTANCES,
             request_id=request_id,
@@ -1174,30 +1339,133 @@ class AsyncSchedulerClient:
         elif response:
             logger.error(f"Failed to refresh instances: {response.error}")
 
-    async def _on_instance_change_notify(self, version: int | None) -> None:
-        """Called when SUB receives instance-change from Scheduler; dedup by version, then refresh cache."""
+    async def _on_instance_change_notify(self, version: int | None, delta: dict | None = None) -> None:
+        """Called when SUB receives instance-change from Scheduler; dedup by version, then apply the
+        incremental ADD/DEL delta when present (no GET), else fall back to a full instance pull.
+        """
         if version is not None and self._last_instance_version is not None and version == self._last_instance_version:
+            return
+        if await self._try_apply_instance_delta(version, delta):
             return
         try:
             await self.get_available_instances(None)
             if version is not None:
                 self._last_instance_version = version
-            if self._on_instance_refreshed:
-                active_endpoints = _collect_active_endpoints_from_cache(self._cache)
-                if active_endpoints:
-                    await self._on_instance_refreshed(active_endpoints)
+            # Remove stale entries for instances that no longer exist in the pool
+            # (covers DEL events where no explicit "closed" message is published).
+            current_ids = {
+                inst.id
+                for role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U)
+                for inst in self._cache.get_instances(role)
+            }
+            self._cb_blocked_instances &= current_ids
+            await self._notify_instance_refreshed()
         except Exception as e:
             logger.warning("Instance change notify refresh failed: %s", e)
 
-    def _select_endpoint_candidates_from_list(
-        self,
-        instances: list[Instance],
-        role: PDRole,
-        req_info: RequestInfo,
-        top_k: int = 1,
-    ) -> list[tuple[Instance, Endpoint, float]]:
-        candidates, _ = self._select_endpoint_candidates_from_list_with_policy(instances, role, req_info, top_k)
-        return candidates
+    async def _try_apply_instance_delta(self, version: int | None, delta: dict | None) -> bool:
+        """Patch the local cache from an ADD/DEL PUB delta without a full GET. Returns True on apply.
+
+        Only apply a delta when it is the next contiguous version.  A dropped or reordered PUB
+        notification must fall back to a full pull; otherwise accepting a later version would hide
+        the gap from the shared-memory version check and leave the cache permanently incomplete.
+        """
+        if not delta or version is None:
+            return False
+        if self._last_instance_version is None or version != self._last_instance_version + 1:
+            return False
+        event = delta.get("event")
+        instances_data = delta.get("instances")
+        if event not in ("add", "del") or not isinstance(instances_data, list):
+            return False
+        instances = []
+        for instance_data in instances_data:
+            instance = _instance_from_dict(instance_data)
+            if instance is None:
+                return False
+            instances.append(instance)
+        if not instances:
+            return False
+        if event == "add":
+            if not await self._cache.apply_add(instances):
+                return False
+        else:
+            await self._cache.apply_remove(instances)
+            self._cb_blocked_instances -= {inst.id for inst in instances}
+        self._last_instance_version = version
+        await self._notify_instance_refreshed()
+        return True
+
+    async def _on_circuit_breaker_change(self, instance_id: int, state: str) -> None:
+        """Update local CB blocked-instance cache when PUB notifies state change."""
+        if state == "open":
+            self._cb_blocked_instances.add(instance_id)
+            logger.warning(
+                "Circuit breaker OPEN: instance_id=%d",
+                instance_id,
+            )
+        elif state == "closed":
+            self._cb_blocked_instances.discard(instance_id)
+            logger.info(
+                "Circuit breaker CLOSED: instance_id=%d",
+                instance_id,
+            )
+
+    def is_instance_blocked(self, instance_id: int) -> bool:
+        """Check whether a specific instance is currently blocked by circuit breaker.
+
+        Lock-free read of the local cache: may return a slightly stale value if
+        ``_on_circuit_breaker_change`` is modifying the set concurrently.  This is
+        acceptable because the cache is best-effort — the authoritative CB state
+        lives on SchedulerServer, which performs the final gate.
+        """
+        return instance_id in self._cb_blocked_instances
+
+    async def report_cb_event(self, instance_id: int, event: str) -> None:
+        """Send a circuit-breaker event ("failure" | "success") to SchedulerServer."""
+        if not self._transport.connected:
+            if event == "failure":
+                logger.warning(
+                    "CircuitBreaker: transport disconnected, failure report dropped: instance_id=%d",
+                    instance_id,
+                )
+            return
+        if event == "failure":
+            logger.warning(
+                "CircuitBreaker: reporting failure to SchedulerServer: instance_id=%d",
+                instance_id,
+            )
+        elif event == "success":
+            logger.info(
+                "CircuitBreaker: reporting success to SchedulerServer: instance_id=%d",
+                instance_id,
+            )
+        else:
+            return
+        request = SchedulerRequest(
+            request_type=SchedulerRequestType.CIRCUIT_BREAKER_REPORT,
+            request_id=str(uuid.uuid4()),
+            data={
+                "instance_id": instance_id,
+                "event": event,
+            },
+        )
+
+        def _on_cb_send_done(fut):
+            if fut.cancelled():
+                return
+            try:
+                fut.result()
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                logger.warning(
+                    "CircuitBreaker: CB report send failed: instance_id=%d event=%s error=%s",
+                    instance_id,
+                    event,
+                    err,
+                )
+
+        task = asyncio.create_task(self._transport.send_request(request))
+        task.add_done_callback(_on_cb_send_done)
 
     def _select_endpoint_candidates_from_list_with_policy(
         self,
@@ -1267,7 +1535,9 @@ class AsyncSchedulerClient:
             if ep:
                 return (instance, ep)
             return (instance, all_endpoints[0])
-        ep = RoundRobinPolicy.select_endpoint_from_instance(instance, self._endpoint_rr_counters)
+        ep = RoundRobinPolicy.select_endpoint_from_instance(
+            instance, self._endpoint_rr_counters, is_blocked=self.is_instance_blocked
+        )
         return (instance, ep) if ep else None
 
     async def _init_cache(self) -> None:
@@ -1291,5 +1561,6 @@ class AsyncSchedulerClient:
             top_k=max(1, top_k),
             instance_score_weight=self._endpoint_instance_score_weight,
             start_index=start_index,
+            is_blocked=self.is_instance_blocked,
         )
         return [(candidate.instance, candidate.endpoint, candidate.score) for candidate in candidates]

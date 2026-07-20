@@ -37,7 +37,6 @@ from motor.config.config_utils import (
     _update_tls_config,
     _update_instances_num,
     _update_prefill_kv_event_config,
-    _redirect_prefill_kv_event_config,
     MGMT_TLS_CONFIG,
     INFER_TLS_CONFIG,
     ETCD_TLS_CONFIG,
@@ -100,6 +99,32 @@ def _default_rate_limit_skip_paths() -> list[str]:
     ]
 
 
+def _merge_kv_store_metrics_config(cfg: dict, raw: dict) -> None:
+    """Populate ``prometheus_metrics_config`` defaults from ``kv_cache_store_config``.
+
+    Only fills fields that are NOT already explicitly set in the prometheus config.
+    Called during ``CoordinatorConfig.from_json()``, before the dict is applied to
+    the dataclass.
+    """
+    kv = raw.get("kv_cache_store_config", {}) if isinstance(raw, dict) else {}
+    if not isinstance(kv, dict) or not kv:
+        return
+    pm = cfg.setdefault("prometheus_metrics_config", {})
+    pm.setdefault("kv_store_backend", kv.get("backend", ""))
+    pm.setdefault(
+        "kv_store_service",
+        kv.get("service", "") or os.getenv("KVS_MASTER_SERVICE", ""),
+    )
+    pm.setdefault("kv_store_metrics_port", kv.get("metrics_port", 0) or int(os.getenv("KV_STORE_METRICS_PORT", "0")))
+    pm.setdefault(
+        "kv_store_metrics_endpoint",
+        os.getenv("KV_STORE_METRICS_URL", ""),
+    )
+    if not pm.get("enable_kv_store_metrics"):
+        # Auto-enable when an explicit kv_cache_store_config is present
+        pm["enable_kv_store_metrics"] = True
+
+
 class SchedulerType(Enum):
     LOAD_BALANCE = "load_balance"
     ROUND_ROBIN = "round_robin"
@@ -124,76 +149,9 @@ KV_AFFINITY_MODES = (KV_AFFINITY_MODE_UNIFIED, KV_AFFINITY_MODE_LOAD_GATED)
 
 
 @dataclass
-class KvConductorConfig:
-    """KV cache event registration configuration for kv-conductor.
-
-    Controls how the Coordinator connects to and registers endpoints with
-    the kv-conductor.  Behaviour varies by ``store_backend``:
-
-    - Mooncake / Memcache: register the pool once (``pool_endpoint``) +
-      per-DP HBM via ``xpu_endpoint``.
-    - YuanRong: per-DP multi-port via ``xpu/cpu/disk_endpoint`` patterns.
-
-    Endpoint patterns use ``*`` as IP placeholder and add ``dp_rank``
-    to the port, e.g. ``"tcp://*:15557"`` resolves to
-    ``tcp://<endpoint_ip>:<15557 + dp_rank>``.
-
-    This config replaces the legacy ``prefill_kv_event_config`` —
-    connection info (``conductor_service``, ``http_server_port``) and
-    engine metadata (``engine_type``, ``model_path``) are now part of
-    this unified config.
-    """
-
-    # ── Conductor connection ──────────────────────────────────────────
-    conductor_service: str = field(default_factory=lambda: Env.conductor_service or "")
-    """kv-conductor hostname / IP. Empty disables the KV conductor."""
-
-    http_server_port: int = 13333
-    """kv-conductor HTTP API port."""
-
-    # ── KV cache identity ─────────────────────────────────────────────
-    store_backend: str = ""
-    """KV cache pooling backend: "Mooncake", "Memcache", "YuanRong"."""
-
-    block_size: int = 128
-    """KV block size in tokens — determines token→hash granularity.
-    Must match the engine's ``--block-size``.  Default 128."""
-
-    engine_type: str = "vLLM"
-    """Inference engine type, sent to conductor on registration."""
-
-    model_path: str = ""
-    """Model path / name, used as ``modelname`` in registration."""
-
-    # ── Endpoint patterns ─────────────────────────────────────────────
-    pool_endpoint: str = ""
-    """Pool service endpoint for centralized backends, e.g. "tcp://kvp-master:5557"."""
-
-    xpu_endpoint: str = ""
-    """Per-DP HBM ZMQ PUB endpoint pattern, e.g. "tcp://*:50090"."""
-
-    cpu_endpoint: str = ""
-    """Per-DP CPU/DDR ZMQ PUB endpoint pattern, e.g. "tcp://*:15558"."""
-
-    disk_endpoint: str = ""
-    """Per-DP DISK/SSD ZMQ PUB endpoint pattern, e.g. "tcp://*:15558"."""
-
-    endpoint: str = ""
-    """Legacy fallback endpoint pattern for all media."""
-
-    replay_endpoint: str = ""
-    """Per-DP replay endpoint pattern, e.g. "tcp://*:6667".
-    vLLM's ZMQ ROUTER for re-broadcasting buffered KV events on
-    conductor restart recovery. Resolved via IP + dp_rank like other endpoints."""
-
-    re_register_interval_sec: int = 0
-    """Interval in seconds for periodic KV instance re-registration.
-    0 or negative disables the re-registration timer."""
-
-
-@dataclass
 class SchedulerConfig:
     scheduler_type: SchedulerType = field(default=SchedulerType.LOAD_BALANCE)
+    enable_pd_separation_fallback_to_hybrid: bool = True
     # Weight of the instance average workload in endpoint-first load balancing.
     # 0 means pure global endpoint minimum; small values preserve instance pressure awareness.
     endpoint_instance_score_weight: float = 0.05
@@ -213,8 +171,6 @@ class SchedulerConfig:
     # Number of least-loaded endpoints kept by the "load_gated" mode before the affinity
     # tie-break. Only used when kv_affinity_mode="load_gated"; 0 (default) falls back to 2.
     kv_affinity_load_gate_topn: int = 0
-    # KV event registration config for kv-conductor.
-    kv_conductor_config: KvConductorConfig = field(default_factory=KvConductorConfig)
 
 
 @dataclass
@@ -222,8 +178,12 @@ class PrometheusMetricsConfig:
     """Prometheus metrics configuration class"""
 
     reuse_time: int = 3
-    pool_metrics_enable: bool = False
-    pool_metrics_endpoint: str = ""
+    # --- KV store metrics (auto-populated from kv_cache_store_config) ---
+    enable_kv_store_metrics: bool = False
+    kv_store_metrics_endpoint: str = ""
+    kv_store_backend: str = ""  # e.g. "memcache", "mooncake"
+    kv_store_service: str = ""  # default falls back to $KVS_MASTER_SERVICE
+    kv_store_metrics_port: int = 0  # 0 → auto: 50088 (mooncake) / 50090 (default)
 
 
 @dataclass
@@ -234,10 +194,11 @@ class ExceptionConfig:
     # Cache token IDs so a streaming request can be rescheduled after a transient transport failure.
     # Engine-side recompute is independent of this switch.
     reschedule_enabled: bool = True
-    transport_max_retry: Optional[int] = None
+    transport_max_retry: int | None = None
     retry_delay: float = 0.2
     first_token_timeout: int = 600  # 10 minutes
     infer_timeout: int = 3600  # 60 minutes
+    connect_timeout: float = 5.0  # TCP connect phase only; set 0 to inherit first_token_timeout
     upstream_error_body_max_bytes: int = 64 * 1024
 
     @property
@@ -382,9 +343,9 @@ class DeployConfig:
 
     p_instances_num: int = 1
     d_instances_num: int = 1
-    hybrid_instances_num: Optional[int] = None
-    single_hybrid_instance_pod_num: Optional[int] = None
-    hybrid_pod_npu_num: Optional[int] = None
+    hybrid_instances_num: int | None = None
+    single_hybrid_instance_pod_num: int | None = None
+    hybrid_pod_npu_num: int | None = None
 
 
 @dataclass
@@ -446,7 +407,7 @@ class CoordinatorConfig:
     config_path: str | None = field(default=None, init=False)
     last_modified: float | None = field(default=None, init=False)
     _errors: list[str] = field(default_factory=list, init=False)
-    worker_index: Optional[int] = field(default=None, repr=False)
+    worker_index: int | None = field(default=None, repr=False)
 
     def __post_init__(self):
         """Validate configuration after initialization"""
@@ -477,8 +438,8 @@ class CoordinatorConfig:
                         ]
                         _update_tls_config(tls_configs, cfg, raw)
                         _update_instances_num(cfg, raw)
-                        _redirect_prefill_kv_event_config(cfg, raw)
                         _update_prefill_kv_event_config(cfg, raw)
+                        _merge_kv_store_metrics_config(cfg, raw)
         except (json.JSONDecodeError, Exception) as e:
             log_json_config_load_error(json_path, e)
 
@@ -550,8 +511,22 @@ class CoordinatorConfig:
                         cfg[AIGW][AIGW_ID] = prefill_resolver.get_model_name("")
                         cfg[AIGW][AIGW_OBJECT] = AIGW_OBJECT_MODEL
                         cfg[AIGW][AIGW_OWNED_BY] = AIGW_OWNED_BY_MOTOR
-                        cfg[AIGW][AIGW_P_MAX_SEQLEN] = normalize_keys(prefill[ENGINE_CONFIG])[MAX_MODEL_LEN]
-                        cfg[AIGW][AIGW_D_MAX_SEQLEN] = normalize_keys(decode[ENGINE_CONFIG])[MAX_MODEL_LEN]
+                        prefill_engine = normalize_keys(prefill[ENGINE_CONFIG])
+                        decode_engine = normalize_keys(decode[ENGINE_CONFIG])
+
+                        if MAX_MODEL_LEN not in prefill_engine:
+                            raise KeyError(
+                                f"'{MAX_MODEL_LEN}' not found in prefill engine_config. "
+                                f"Available keys: {sorted(prefill_engine.keys())}"
+                            )
+                        if MAX_MODEL_LEN not in decode_engine:
+                            raise KeyError(
+                                f"'{MAX_MODEL_LEN}' not found in decode engine_config. "
+                                f"Available keys: {sorted(decode_engine.keys())}"
+                            )
+
+                        cfg[AIGW][AIGW_P_MAX_SEQLEN] = prefill_engine[MAX_MODEL_LEN]
+                        cfg[AIGW][AIGW_D_MAX_SEQLEN] = decode_engine[MAX_MODEL_LEN]
                         cfg[AIGW].setdefault(SLO_TTFT, 1000)
                         cfg[AIGW].setdefault(SLO_TPOT, 50)
                 except Exception as e:
@@ -635,6 +610,7 @@ class CoordinatorConfig:
         self._validate_positive_number(self.exception_config.retry_delay, "retry_delay")
         self._validate_positive_number(self.exception_config.first_token_timeout, "first_token_timeout")
         self._validate_positive_number(self.exception_config.infer_timeout, "infer_timeout")
+        self._validate_positive_number(self.exception_config.connect_timeout, "connect_timeout", allow_zero=True)
         self._validate_positive_number(
             self.exception_config.upstream_error_body_max_bytes,
             "upstream_error_body_max_bytes",
@@ -768,7 +744,7 @@ class CoordinatorConfig:
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-    def get_aigw_models(self) -> Optional[dict[str, Any]]:
+    def get_aigw_models(self) -> dict[str, Any] | None:
         """Return configured AIGW model."""
         return self.aigw_model
 
@@ -827,17 +803,17 @@ class CoordinatorConfig:
         master_lock_ttl = self.standby_config.master_lock_ttl
         master_lock_key = self.standby_config.master_lock_key
         deploy_summary = (
-            f"    ?? p_instances_num:     {self.deploy_config.p_instances_num}\n"
-            f"    ?? d_instances_num:     {self.deploy_config.d_instances_num}\n"
+            f"    ├─ p_instances_num:     {self.deploy_config.p_instances_num}\n"
+            f"    └─ d_instances_num:     {self.deploy_config.d_instances_num}\n"
         )
         if self.deploy_config.hybrid_instances_num is not None:
             deploy_summary = (
-                f"    ?? p_instances_num: {self.deploy_config.p_instances_num}\n"
-                f"    ?? d_instances_num: {self.deploy_config.d_instances_num}\n"
-                f"    ?? hybrid_instances_num: {self.deploy_config.hybrid_instances_num}\n"
-                f"    ?? single_hybrid_instance_pod_num: "
+                f"    ├─ p_instances_num:        {self.deploy_config.p_instances_num}\n"
+                f"    ├─ d_instances_num:        {self.deploy_config.d_instances_num}\n"
+                f"    ├─ hybrid_instances_num:   {self.deploy_config.hybrid_instances_num}\n"
+                f"    ├─ single_hybrid_instance_pod_num: "
                 f"{self.deploy_config.single_hybrid_instance_pod_num}\n"
-                f"    ?? hybrid_pod_npu_num: {self.deploy_config.hybrid_pod_npu_num}\n"
+                f"    └─ hybrid_pod_npu_num:     {self.deploy_config.hybrid_pod_npu_num}\n"
             )
         return (
             f"{separator}\n"
@@ -846,51 +822,47 @@ class CoordinatorConfig:
             "  Deploy Configuration:\n"
             f"{deploy_summary}"
             "  Logging Configuration:\n"
-            f"    ?? Log Level:           {self.logging_config.log_level}\n"
-            f"    ?? Log File:            {self.logging_config.host_log_dir}\n"
-            f"    ?? Log Max Line Length: {self.logging_config.log_max_line_length}\n"
+            f"    ├─ Log Level:           {self.logging_config.log_level}\n"
+            f"    ├─ Log File:            {self.logging_config.host_log_dir}\n"
+            f"    └─ Log Max Line Length: {self.logging_config.log_max_line_length}\n"
             "\n"
             "  Network Configuration:\n"
-            f"    ?? HTTP Pod IP:         {self.api_config.coordinator_api_host}\n"
-            f"    ?? HTTP Pod DNS:         {self.api_config.coordinator_api_dns}\n"
-            f"    ?? Inference Port:      {self.api_config.coordinator_api_infer_port}\n"
-            f"    ?? Management Port:     {self.api_config.coordinator_api_mgmt_port}\n"
-            f"    ?? Observability Port:  {self.api_config.coordinator_obs_port}\n"
+            f"    ├─ HTTP Pod IP:         {self.api_config.coordinator_api_host}\n"
+            f"    ├─ HTTP Pod DNS:        {self.api_config.coordinator_api_dns}\n"
+            f"    ├─ Inference Port:      {self.api_config.coordinator_api_infer_port}\n"
+            f"    ├─ Management Port:     {self.api_config.coordinator_api_mgmt_port}\n"
+            f"    └─ Observability Port:  {self.api_config.coordinator_obs_port}\n"
             "\n"
             "  Scheduler Configuration:\n"
-            f"    ├─ Scheduler Type:            {self.scheduler_config.scheduler_type.value}\n"
-            f"    ├─ Endpoint Instance Weight:  "
-            f"{self.scheduler_config.endpoint_instance_score_weight}\n"
-            f"    ?? KV Affinity Mode:          "
-            f"{self.scheduler_config.kv_affinity_mode}\n"
-            f"    ?? KV Affinity Load Weight:   "
-            f"{self.scheduler_config.kv_affinity_load_weight}\n"
-            f"    ?? KV Affinity Load Gate TopN:"
-            f"{self.scheduler_config.kv_affinity_load_gate_topn}\n"
+            f"    ├─ Scheduler Type:             {self.scheduler_config.scheduler_type.value}\n"
+            f"    ├─ Endpoint Instance Weight:   {self.scheduler_config.endpoint_instance_score_weight}\n"
+            f"    ├─ KV Affinity Mode:           {self.scheduler_config.kv_affinity_mode}\n"
+            f"    ├─ KV Affinity Load Weight:    {self.scheduler_config.kv_affinity_load_weight}\n"
+            f"    └─ KV Affinity Load Gate TopN: {self.scheduler_config.kv_affinity_load_gate_topn}\n"
             "\n"
             "  Multiprocess (Inference Workers):\n"
-            f"    └─ Num Workers:               {self.inference_workers_config.num_workers}\n"
+            f"    └─ Num Workers: {self.inference_workers_config.num_workers}\n"
             "\n"
             "  Security:\n"
-            f"    ?? Infer TLS:           {'Enabled' if self.infer_tls_config.enable_tls else 'Disabled'}\n"
-            f"    ?? Management TLS:      {'Enabled' if self.mgmt_tls_config.enable_tls else 'Disabled'}\n"
-            f"    ?? Etcd TLS:            {'Enabled' if self.etcd_tls_config.enable_tls else 'Disabled'}\n"
-            f"    ?? API Key Auth:        {'Enabled' if self.api_key_config.enable_api_key else 'Disabled'}\n"
-            f"    ?? Rate Limiting:       {'Enabled' if self.rate_limit_config.enable_rate_limit else 'Disabled'}\n"
+            f"    ├─ Infer TLS:           {'Enabled' if self.infer_tls_config.enable_tls else 'Disabled'}\n"
+            f"    ├─ Management TLS:      {'Enabled' if self.mgmt_tls_config.enable_tls else 'Disabled'}\n"
+            f"    ├─ Etcd TLS:            {'Enabled' if self.etcd_tls_config.enable_tls else 'Disabled'}\n"
+            f"    ├─ API Key Auth:        {'Enabled' if self.api_key_config.enable_api_key else 'Disabled'}\n"
+            f"    └─ Rate Limiting:       {'Enabled' if self.rate_limit_config.enable_rate_limit else 'Disabled'}\n"
             "\n"
             "  High Availability:\n"
-            f"    ?? ETCD:\n"
-            f"    ?   ?? Persistence:       {'Enabled' if self.etcd_config.enable_etcd_persistence else 'Disabled'}\n"
-            f"    ?   ?? Host:              {etcd_host}\n"
-            f"    ?   ?? Port:              {etcd_port}\n"
-            f"    ?   ?? Timeout:           {etcd_timeout} seconds\n"
-            f"    ?? Master/Standby:      {'Enabled' if self.standby_config.enable_master_standby else 'Disabled'}\n"
-            f"        ?? Check Interval:   {master_standby_check_interval} seconds\n"
-            f"        ?? Lock TTL:         {master_lock_ttl} seconds\n"
-            f"        ?? Lock Key:         {master_lock_key}\n"
+            f"    ├─ ETCD:\n"
+            f"    │   ├─ Persistence:       {'Enabled' if self.etcd_config.enable_etcd_persistence else 'Disabled'}\n"
+            f"    │   ├─ Host:              {etcd_host}\n"
+            f"    │   ├─ Port:              {etcd_port}\n"
+            f"    │   └─ Timeout:           {etcd_timeout} seconds\n"
+            f"    └─ Master/Standby:      {'Enabled' if self.standby_config.enable_master_standby else 'Disabled'}\n"
+            f"        ├─ Check Interval:   {master_standby_check_interval} seconds\n"
+            f"        ├─ Lock TTL:         {master_lock_ttl} seconds\n"
+            f"        └─ Lock Key:         {master_lock_key}\n"
             "\n"
             "  Configuration:\n"
-            f"    ?? Config Path:         {self.config_path or 'Not set'}\n"
+            f"    └─ Config Path: {self.config_path or 'Not set'}\n"
             f"{separator}"
         )
 

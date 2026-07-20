@@ -60,32 +60,16 @@ def _make_instance(
 
 
 def _mock_config(**overrides) -> Mock:
-    """Build a mocked coordinator_config with both new kv_conductor_config
-    and legacy prefill_kv_event_config."""
-    from motor.config.coordinator import KvConductorConfig, SchedulerConfig
-
-    reg = KvConductorConfig(
-        store_backend=overrides.get("store_backend", "Mooncake"),
-        xpu_endpoint=overrides.get("xpu_endpoint", "tcp://*:5557"),
-        endpoint=overrides.get("endpoint", "tcp://*:5557"),
-        replay_endpoint=overrides.get("replay_endpoint", ""),
-        engine_type=overrides.get("engine_type", "vLLM"),
-        block_size=overrides.get("block_size", 128),
-        conductor_service=overrides.get("conductor_service", "kv-conductor"),
-        http_server_port=overrides.get("http_server_port", 13333),
-    )
-    sched = SchedulerConfig(kv_conductor_config=reg)
+    """Build a mocked coordinator_config with prefill_kv_event_config."""
     cfg = Mock()
-    cfg.scheduler_config = sched
-    # Legacy config for backward compatibility
-    legacy = Mock()
-    legacy.endpoint = overrides.get("endpoint", "tcp://*:5557")
-    legacy.replay_endpoint = overrides.get("replay_endpoint", "")
-    legacy.engine_type = overrides.get("engine_type", "vLLM")
-    legacy.block_size = overrides.get("block_size", 128)
-    legacy.conductor_service = overrides.get("conductor_service", "kv-conductor")
-    legacy.http_server_port = overrides.get("http_server_port", 13333)
-    cfg.prefill_kv_event_config = legacy
+    kv = Mock()
+    kv.endpoint = overrides.get("endpoint", "tcp://*:5557")
+    kv.replay_endpoint = overrides.get("replay_endpoint", "")
+    kv.engine_type = overrides.get("engine_type", "vLLM")
+    kv.block_size = overrides.get("block_size", 128)
+    kv.conductor_service = overrides.get("conductor_service", "kv-conductor")
+    kv.http_server_port = overrides.get("http_server_port", 13333)
+    cfg.prefill_kv_event_config = kv
     return cfg
 
 
@@ -118,11 +102,11 @@ class TestConductorInstanceId:
 
 
 class TestBuildRegisterPayload:
-    """Cover branches of _build_register_payload (uses kv_conductor_config)."""
+    """Cover branches of _build_register_payload."""
 
-    def test_returns_empty_dict_when_no_endpoints_configured(self):
-        """No endpoint patterns configured → empty dict."""
-        cfg = _mock_config(xpu_endpoint="", endpoint="", replay_endpoint="")
+    def test_returns_empty_dict_when_endpoint_format_invalid(self):
+        """endpoint without '*:' separator → empty dict."""
+        cfg = _mock_config(endpoint="tcp://127.0.0.1:5557")
         inst = _make_instance(inst_id=1, role=PDRole.ROLE_P)
         ep = _make_endpoint(ep_id=0, ip="10.0.0.1")
 
@@ -131,26 +115,28 @@ class TestBuildRegisterPayload:
 
         assert payload == {}
 
-    def test_basic_payload_with_xpu_endpoint(self):
-        """Standard payload with medium_endpoints via xpu_endpoint (no fallback)."""
-        cfg = _mock_config(xpu_endpoint="tcp://*:5557", endpoint="")
+    def test_basic_payload_without_replay(self):
+        """Standard payload without replay_endpoint."""
+        cfg = _mock_config(endpoint="tcp://*:5557", replay_endpoint="")
         inst = _make_instance(inst_id=1, role=PDRole.ROLE_P, model_name="qwen")
         ep = _make_endpoint(ep_id=0, ip="10.0.0.1")
 
         with patch.object(ConductorApiClient, "coordinator_config", cfg):
             payload = ConductorApiClient._build_register_payload(inst, ep)
 
-        assert payload["instance_id"] == "vllm-prefill-1"
-        assert payload["dp_rank"] == 0
-        assert payload["medium_endpoints"] == {"xpu": "tcp://10.0.0.1:5557"}
-        assert payload["type"] == "vLLM"
-        assert payload["modelname"] == "qwen"
-        assert payload["block_size"] == 128
+        assert payload == {
+            "endpoint": "tcp://10.0.0.1:5557",
+            "type": "vLLM",
+            "modelname": "qwen",
+            "block_size": 128,
+            "instance_id": "vllm-prefill-1",
+            "dp_rank": 0,
+        }
 
     def test_payload_with_replay_endpoint(self):
         """Payload includes replay_endpoint when configured."""
         cfg = _mock_config(
-            xpu_endpoint="tcp://*:5557",
+            endpoint="tcp://*:5557",
             replay_endpoint="tcp://*:6667",
         )
         inst = _make_instance(inst_id=2, role=PDRole.ROLE_U, model_name="qwen")
@@ -165,7 +151,7 @@ class TestBuildRegisterPayload:
 
     def test_payload_dp_rank_uses_endpoint_id(self):
         """dp_rank is taken from endpoint.id."""
-        cfg = _mock_config(xpu_endpoint="tcp://*:5557")
+        cfg = _mock_config(endpoint="tcp://*:5557")
         inst = _make_instance(inst_id=3, role=PDRole.ROLE_P)
         ep = _make_endpoint(ep_id=5, ip="10.0.0.3")
 
@@ -173,29 +159,16 @@ class TestBuildRegisterPayload:
             payload = ConductorApiClient._build_register_payload(inst, ep)
 
         assert payload["dp_rank"] == 5
-        assert payload["medium_endpoints"]["xpu"] == "tcp://10.0.0.3:5562"
+        assert payload["endpoint"] == "tcp://10.0.0.3:5562"
 
-    def test_payload_with_fallback_endpoint(self):
-        """Legacy 'endpoint' fallback pattern used when xpu_endpoint empty."""
-        cfg = _mock_config(xpu_endpoint="", endpoint="tcp://*:15557")
-        inst = _make_instance(inst_id=4, role=PDRole.ROLE_P)
-        ep = _make_endpoint(ep_id=0, ip="10.0.0.4")
-
-        with patch.object(ConductorApiClient, "coordinator_config", cfg):
-            payload = ConductorApiClient._build_register_payload(inst, ep)
-
-        # Fallback endpoint fills xpu, cpu, disk
-        meps = payload["medium_endpoints"]
-        assert "xpu" in meps
-
-    def test_replay_endpoint_malformed_skipped(self):
+    def test_replay_endpoint_format_invalid_no_star_colon(self):
         """replay_endpoint without '*:' → replay_endpoint absent in payload."""
         cfg = _mock_config(
-            xpu_endpoint="tcp://*:5557",
+            endpoint="tcp://*:5557",
             replay_endpoint="tcp://127.0.0.1:6667",
         )
-        inst = _make_instance(inst_id=5, role=PDRole.ROLE_P)
-        ep = _make_endpoint(ep_id=0, ip="10.0.0.5")
+        inst = _make_instance(inst_id=4, role=PDRole.ROLE_P)
+        ep = _make_endpoint(ep_id=0, ip="10.0.0.4")
 
         with patch.object(ConductorApiClient, "coordinator_config", cfg):
             payload = ConductorApiClient._build_register_payload(inst, ep)
@@ -209,90 +182,69 @@ class TestBuildRegisterPayload:
 
 
 class TestNormalizeServiceKey:
-    """Cover field extraction from both kv-conductor and Mooncake Master formats."""
+    """Cover field extraction from both uppercase/lowercase Conductor responses."""
 
-    # ── kv-conductor format (WorkerSummary) ──────────────────────────
-
-    def test_kv_conductor_single_dp(self):
-        """WorkerSummary with one DP extracts correctly."""
-        worker = {
-            "instance_id": "vllm-prefill-1",
-            "endpoints": {
-                "0": {
-                    "medium_endpoints": {"xpu": "tcp://10.0.0.1:5557"},
-                    "dp_rank": 0,
-                }
-            },
-        }
-        keys = ConductorApiClient._normalize_service_key(worker)
-        assert keys == {("vllm-prefill-1", 0)}
-
-    def test_kv_conductor_multiple_dps(self):
-        """WorkerSummary with multiple DPs extracts all."""
-        worker = {
-            "instance_id": "vllm-union-2",
-            "endpoints": {
-                "0": {"medium_endpoints": {"xpu": "tcp://10.0.0.1:5557"}},
-                "1": {"medium_endpoints": {"xpu": "tcp://10.0.0.1:5558"}},
-            },
-        }
-        keys = ConductorApiClient._normalize_service_key(worker)
-        assert keys == {("vllm-union-2", 0), ("vllm-union-2", 1)}
-
-    def test_kv_conductor_empty_endpoints(self):
-        """No endpoints → empty set."""
-        worker = {"instance_id": "vllm-prefill-1", "endpoints": {}}
-        keys = ConductorApiClient._normalize_service_key(worker)
-        assert keys == set()
-
-    def test_kv_conductor_non_numeric_dp_rank_skipped(self):
-        """Non-numeric dp_rank string → skipped."""
-        worker = {
-            "instance_id": "vllm-prefill-1",
-            "endpoints": {
-                "abc": {"medium_endpoints": {"xpu": "tcp://x:1"}},
-                "0": {"medium_endpoints": {"xpu": "tcp://x:2"}},
-            },
-        }
-        keys = ConductorApiClient._normalize_service_key(worker)
-        assert keys == {("vllm-prefill-1", 0)}
-
-    # ── Mooncake Master format (flat fields) ─────────────────────────
-
-    def test_mooncake_master_basic(self):
-        """Mooncake Master: InstanceID + DPRank."""
+    def test_all_uppercase_keys(self):
         service = {
             "InstanceID": "vllm-prefill-1",
             "DPRank": 0,
             "Endpoint": "tcp://10.0.0.1:5557",
             "ReplayEndpoint": "tcp://10.0.0.1:6667",
         }
-        keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == {("vllm-prefill-1", 0)}
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key == ("vllm-prefill-1", 0, "tcp://10.0.0.1:5557", "tcp://10.0.0.1:6667")
 
-    def test_mooncake_master_dp_rank_zero(self):
-        """dp_rank=0 must NOT be treated as falsy."""
+    def test_lowercase_keys_not_found_by_uppercase_lookup(self):
+        """Only uppercase keys are read; lowercase keys are ignored → defaults."""
+        service = {
+            "instance_id": "vllm-union-2",
+            "dp_rank": 1,
+            "endpoint": "tcp://10.0.0.2:5558",
+            "replay_endpoint": "tcp://10.0.0.2:6668",
+        }
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key == ("", -1, "", "")  # all defaults since uppercase keys absent
+
+    def test_dp_rank_zero(self):
+        """dp_rank=0 must NOT be treated as falsy — integer DPRank is kept."""
         service = {"InstanceID": "vllm-prefill-1", "DPRank": 0}
-        keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == {("vllm-prefill-1", 0)}
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key[1] == 0
 
-    def test_mooncake_master_dp_rank_missing_defaults_to_minus_one(self):
+    def test_dp_rank_missing_defaults_to_minus_one(self):
         """No DPRank key → defaults to -1."""
         service = {"InstanceID": "vllm-prefill-1"}
-        keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == {("vllm-prefill-1", -1)}
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key[1] == -1
 
-    def test_mooncake_master_dp_rank_non_numeric(self):
+    def test_dp_rank_non_numeric_string_returns_minus_one(self):
         """DPRank is a non-numeric string → -1."""
         service = {"InstanceID": "vllm-prefill-1", "DPRank": "abc"}
-        keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == {("vllm-prefill-1", -1)}
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key[1] == -1
 
-    def test_mooncake_master_instance_id_empty(self):
-        """Missing InstanceID → empty set."""
+    def test_dp_rank_empty_string_returns_minus_one(self):
+        """DPRank is an empty string → -1 (str.isdigit is False)."""
+        service = {"InstanceID": "vllm-prefill-1", "DPRank": ""}
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key[1] == -1
+
+    def test_instance_id_empty_when_missing(self):
         service = {"DPRank": 0}
-        keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == set()
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key[0] == ""
+
+    def test_endpoint_empty_when_missing(self):
+        """Missing Endpoint → empty string."""
+        service = {"InstanceID": "vllm-prefill-1", "DPRank": 0}
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key[2] == ""
+
+    def test_replay_endpoint_empty_when_missing(self):
+        """Missing ReplayEndpoint → empty string."""
+        service = {"InstanceID": "vllm-prefill-1", "DPRank": 0, "Endpoint": "tcp://x:1"}
+        key = ConductorApiClient._normalize_service_key(service)
+        assert key[3] == ""
 
 
 # ------------------------------------------------------------------
@@ -301,12 +253,11 @@ class TestNormalizeServiceKey:
 
 
 class TestGetRegisteredServices:
-    """Cover both kv-conductor /workers and Mooncake Master /services fallback."""
+    """Cover success, format mismatch, and exception paths."""
 
-    def test_returns_workers_list(self):
-        """kv-conductor: GET /workers returns workers list."""
+    def test_returns_services_list(self):
         cfg = _mock_config()
-        response = {"workers": [{"instance_id": "vllm-prefill-1", "endpoints": {"0": {}}}]}
+        response = {"services": [{"InstanceID": "vllm-prefill-1", "DPRank": 0}]}
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -315,56 +266,7 @@ class TestGetRegisteredServices:
             mock_http.return_value.__enter__.return_value.get.return_value = response
             services = ConductorApiClient.get_registered_services()
 
-        assert services == [{"instance_id": "vllm-prefill-1", "endpoints": {"0": {}}}]
-
-    def test_falls_back_to_services_when_workers_empty(self):
-        """When /workers returns no workers, fall back to /services (Mooncake Master)."""
-        cfg = _mock_config()
-        mooncake_response = {"services": [{"InstanceID": "vllm-prefill-1", "DPRank": 0}]}
-
-        with (
-            patch.object(ConductorApiClient, "coordinator_config", cfg),
-            patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
-        ):
-            # /workers returns empty list → fallback to /services
-            mock_http.return_value.__enter__.return_value.get.side_effect = [
-                {"workers": []},           # /workers (empty → fallback)
-                mooncake_response,          # /services
-            ]
-            services = ConductorApiClient.get_registered_services()
-
         assert services == [{"InstanceID": "vllm-prefill-1", "DPRank": 0}]
-
-    def test_falls_back_to_services_when_workers_fails(self):
-        """When /workers raises, fall back to /services."""
-        cfg = _mock_config()
-        mooncake_response = {"services": [{"InstanceID": "vllm-prefill-2", "DPRank": 1}]}
-
-        with (
-            patch.object(ConductorApiClient, "coordinator_config", cfg),
-            patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
-        ):
-            # /workers raises ConnectionError → fallback to /services
-            mock_http.return_value.__enter__.return_value.get.side_effect = [
-                ConnectionError("conn refused"),  # /workers
-                mooncake_response,                # /services
-            ]
-            services = ConductorApiClient.get_registered_services()
-
-        assert services == [{"InstanceID": "vllm-prefill-2", "DPRank": 1}]
-
-    def test_returns_empty_when_both_fail(self):
-        """When both /workers and /services raise, return empty."""
-        cfg = _mock_config()
-
-        with (
-            patch.object(ConductorApiClient, "coordinator_config", cfg),
-            patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
-        ):
-            mock_http.return_value.__enter__.return_value.get.side_effect = ConnectionError("conn refused")
-            services = ConductorApiClient.get_registered_services()
-
-        assert services == []
 
     def test_returns_empty_when_response_not_dict(self):
         cfg = _mock_config()
@@ -377,6 +279,30 @@ class TestGetRegisteredServices:
             services = ConductorApiClient.get_registered_services()
 
         assert services == []
+
+    def test_returns_empty_when_services_not_list(self):
+        cfg = _mock_config()
+        response = {"services": "not-a-list"}
+
+        with (
+            patch.object(ConductorApiClient, "coordinator_config", cfg),
+            patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
+        ):
+            mock_http.return_value.__enter__.return_value.get.return_value = response
+            services = ConductorApiClient.get_registered_services()
+
+        assert services == []
+
+    def test_raises_on_http_error(self):
+        cfg = _mock_config()
+
+        with (
+            patch.object(ConductorApiClient, "coordinator_config", cfg),
+            patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
+        ):
+            mock_http.return_value.__enter__.return_value.get.side_effect = RuntimeError("conn refused")
+            with pytest.raises(RuntimeError, match="conn refused"):
+                ConductorApiClient.get_registered_services()
 
 
 # ------------------------------------------------------------------
@@ -416,10 +342,10 @@ class TestReRegisterKvInstances:
 
         mock_register.assert_not_called()
 
-    def test_skip_when_no_endpoints_configured(self):
-        """No endpoint patterns → _build_register_payload returns {} → skip."""
+    def test_skip_when_payload_empty(self):
+        """_build_register_payload returns {} → skip."""
         inst = _make_instance(inst_id=1, role=PDRole.ROLE_P)
-        cfg = _mock_config(xpu_endpoint="", endpoint="")
+        cfg = _mock_config(endpoint="tcp://127.0.0.1:5557")  # no '*:' → empty payload
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -436,10 +362,10 @@ class TestReRegisterKvInstances:
         endpoints = {"pod-0": {0: ep}}
         inst = Instance(id=1, role=PDRole.ROLE_P, model_name="qwen", job_name="test-job", endpoints=endpoints)
 
-        cfg = _mock_config(xpu_endpoint="tcp://*:5557")
+        cfg = _mock_config(endpoint="tcp://*:5557")
 
-        # Conductor has a DIFFERENT instance registered
-        registered = [{"instance_id": "vllm-prefill-99", "endpoints": {"0": {}}}]
+        # Conductor has a DIFFERENT service registered
+        registered = [{"InstanceID": "vllm-prefill-99", "DPRank": 0, "Endpoint": "tcp://10.0.0.99:5557"}]
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -456,11 +382,17 @@ class TestReRegisterKvInstances:
         endpoints = {"pod-0": {0: ep}}
         inst = Instance(id=1, role=PDRole.ROLE_P, model_name="qwen", job_name="test-job", endpoints=endpoints)
 
-        cfg = _mock_config(xpu_endpoint="tcp://*:5557")
+        # Use replay_endpoint so both payload and Conductor response have it
+        cfg = _mock_config(endpoint="tcp://*:5557", replay_endpoint="tcp://*:6667")
 
-        # Same (instance_id, dp_rank) already registered
+        # Exact match: same instance_id, dp_rank=0, endpoint, replay_endpoint
         registered = [
-            {"instance_id": "vllm-prefill-1", "endpoints": {"0": {"medium_endpoints": {"xpu": "tcp://10.0.0.1:5557"}}}}
+            {
+                "InstanceID": "vllm-prefill-1",
+                "DPRank": 0,
+                "Endpoint": "tcp://10.0.0.1:5557",
+                "ReplayEndpoint": "tcp://10.0.0.1:6667",
+            }
         ]
 
         with (
@@ -479,11 +411,17 @@ class TestReRegisterKvInstances:
         endpoints = {"pod-0": {0: ep0, 1: ep1}}
         inst = Instance(id=1, role=PDRole.ROLE_P, model_name="qwen", job_name="test-job", endpoints=endpoints)
 
-        cfg = _mock_config(xpu_endpoint="tcp://*:5557")
+        # Use replay_endpoint so that payload includes it
+        cfg = _mock_config(endpoint="tcp://*:5557", replay_endpoint="tcp://*:6667")
 
         # ep0 (dp_rank=0) already registered; ep1 (dp_rank=1) missing
         registered = [
-            {"instance_id": "vllm-prefill-1", "endpoints": {"0": {"medium_endpoints": {"xpu": "tcp://10.0.0.1:5557"}}}}
+            {
+                "InstanceID": "vllm-prefill-1",
+                "DPRank": 0,
+                "Endpoint": "tcp://10.0.0.1:5557",
+                "ReplayEndpoint": "tcp://10.0.0.1:6667",
+            }
         ]
 
         with (
@@ -497,43 +435,3 @@ class TestReRegisterKvInstances:
         assert mock_register.call_count == 1
         called_ep = mock_register.call_args[0][1]
         assert called_ep.id == 1
-
-    def test_skips_when_already_registered_mooncake_format(self):
-        """Instance already registered (Mooncake Master format) → skip."""
-        ep = _make_endpoint(ep_id=0, ip="10.0.0.1")
-        endpoints = {"pod-0": {0: ep}}
-        inst = Instance(id=1, role=PDRole.ROLE_P, model_name="qwen", job_name="test-job", endpoints=endpoints)
-
-        cfg = _mock_config(xpu_endpoint="tcp://*:5557")
-
-        # Mooncake Master format: InstanceID + DPRank
-        registered = [{"InstanceID": "vllm-prefill-1", "DPRank": 0, "Endpoint": "tcp://10.0.0.1:5557"}]
-
-        with (
-            patch.object(ConductorApiClient, "coordinator_config", cfg),
-            patch.object(ConductorApiClient, "get_registered_services", return_value=registered),
-            patch.object(ConductorApiClient, "register_post") as mock_register,
-        ):
-            ConductorApiClient.re_register_kv_instances([inst])
-
-        mock_register.assert_not_called()
-
-    def test_re_registers_missing_mooncake_format(self):
-        """Instance missing (Mooncake Master format) → register_post called."""
-        ep = _make_endpoint(ep_id=0, ip="10.0.0.1")
-        endpoints = {"pod-0": {0: ep}}
-        inst = Instance(id=1, role=PDRole.ROLE_P, model_name="qwen", job_name="test-job", endpoints=endpoints)
-
-        cfg = _mock_config(xpu_endpoint="tcp://*:5557")
-
-        # Different instance registered
-        registered = [{"InstanceID": "vllm-prefill-99", "DPRank": 0, "Endpoint": "tcp://10.0.0.99:5557"}]
-
-        with (
-            patch.object(ConductorApiClient, "coordinator_config", cfg),
-            patch.object(ConductorApiClient, "get_registered_services", return_value=registered),
-            patch.object(ConductorApiClient, "register_post") as mock_register,
-        ):
-            ConductorApiClient.re_register_kv_instances([inst])
-
-        mock_register.assert_called_once_with(inst, ep)

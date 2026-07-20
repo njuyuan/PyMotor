@@ -1,12 +1,14 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 
 import logging
+import sys
 
 import pytest
 
 from motor.common.logger import logger as logger_module
 from motor.common.logger.formatter import ColoredFormatter, NewLineFormatter
 from motor.common.logger.logger import (
+    MaxLengthFormatter,
     _resolve_logger_name,
     _suppress_noisy_third_party_loggers,
     get_logger,
@@ -72,6 +74,52 @@ class TestLogFormatter:
         assert "%(processName)s pid=%(process)d)" in fmt
         assert "[%(name)s][%(fileinfo)s:%(lineno)d]" in fmt
 
+    def test_max_length_formatter_keeps_multiline_traceback(self):
+        config = LoggingConfig()
+
+        def _capture_exc_info():
+            try:
+                raise ValueError("boom")
+            except ValueError:
+                return sys.exc_info()
+            raise AssertionError("expected ValueError")
+
+        exc_info = _capture_exc_info()
+
+        record = logging.LogRecord(
+            name="engine_server",
+            level=logging.ERROR,
+            pathname="/app/motor/engine_server/cli/dispatch.py",
+            lineno=223,
+            msg="Error occurred",
+            args=(),
+            exc_info=exc_info,
+        )
+        record.filename = "dispatch.py"
+        record.processName = "MainProcess"
+        record.process = 47
+
+        formatter = MaxLengthFormatter(
+            NewLineFormatter(config.log_format, datefmt=config.log_date_format),
+            config.log_max_line_length,
+        )
+        output = formatter.format(record)
+
+        assert "\\r\\n" not in output
+        assert "Traceback (most recent call last):" in output
+        assert output.count("\n") >= 2
+        assert output.count("(MainProcess pid=47) ERROR ") >= 2
+
+    def test_max_length_formatter_truncates_long_output(self, record):
+        config = LoggingConfig()
+        formatter = MaxLengthFormatter(
+            NewLineFormatter(config.log_format, datefmt=config.log_date_format),
+            max_length=80,
+        )
+        output = formatter.format(record)
+        assert len(output) == 83
+        assert output.endswith("...")
+
 
 class TestThirdPartySuppression:
     """Verify the vLLM-style third-party logger suppression is wired correctly.
@@ -83,10 +131,48 @@ class TestThirdPartySuppression:
 
     @pytest.fixture
     def reset_singletons(self):
+        def snapshot_loggers():
+            loggers = {"": logging.getLogger()}
+            for name, logger in logging.Logger.manager.loggerDict.items():
+                if isinstance(logger, logging.Logger):
+                    loggers[name] = logger
+            return {
+                name: {
+                    "level": logger.level,
+                    "propagate": logger.propagate,
+                    "disabled": logger.disabled,
+                    "handlers": list(logger.handlers),
+                    "filters": list(logger.filters),
+                }
+                for name, logger in loggers.items()
+            }
+
+        def restore_logger_state(snapshot):
+            current_names = {""}
+            current_names.update(
+                name for name, logger in logging.Logger.manager.loggerDict.items() if isinstance(logger, logging.Logger)
+            )
+            for name in current_names:
+                logger = logging.getLogger(name)
+                state = snapshot.get(name)
+                if state is None:
+                    logger.handlers = []
+                    logger.filters = []
+                    logger.setLevel(logging.NOTSET)
+                    logger.propagate = True
+                    logger.disabled = False
+                    continue
+                logger.handlers = list(state["handlers"])
+                logger.filters = list(state["filters"])
+                logger.setLevel(state["level"])
+                logger.propagate = state["propagate"]
+                logger.disabled = state["disabled"]
+
+        logger_snapshot = snapshot_loggers()
         original_handlers = list(logger_module._shared_handlers)
         original_buckets = set(logger_module._motor_buckets)
+        original_logged_modules = set(logger_module._logged_modules)
         original_root_handlers = list(logging.getLogger().handlers)
-        original_root_level = logging.getLogger().level
         logger_module._shared_handlers = []
         logger_module._motor_buckets = set()
         # Detach any handlers that earlier cases (or the real bootstrap) put on root.
@@ -100,9 +186,11 @@ class TestThirdPartySuppression:
                     logging.getLogger(bucket_name).removeHandler(h)
             logger_module._shared_handlers = original_handlers
             logger_module._motor_buckets = original_buckets
+            logger_module._logged_modules = original_logged_modules
+            restore_logger_state(logger_snapshot)
             for h in original_root_handlers:
-                logging.getLogger().addHandler(h)
-            logging.getLogger().setLevel(original_root_level)
+                if h not in logging.getLogger().handlers:
+                    logging.getLogger().addHandler(h)
 
     def test_get_logger_does_not_attach_to_root(self, reset_singletons, capsys):
         """get_logger must wire motor buckets; root must not carry motor handlers."""
@@ -162,22 +250,21 @@ class TestThirdPartySuppression:
 
         assert propagated_into_bucket is False
 
-    def test_suppress_noisy_libs_only_at_info(self, reset_singletons):
-        """Point-kill fires only when log_level == INFO."""
+    def test_suppress_noisy_libs_at_all_levels(self, reset_singletons):
+        """Point-kill fires regardless of motor log_level (default WARNING)."""
         for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
-            # Reset to a known non-WARNING level so we can detect changes.
             logging.getLogger(name).setLevel(logging.NOTSET)
 
-        _suppress_noisy_third_party_loggers("INFO")
+        _suppress_noisy_third_party_loggers(LoggingConfig(log_level="INFO"))
         for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
             assert logging.getLogger(name).level == logging.WARNING
 
-        # Re-arm as if user had set DEBUG: reconfigure should NOT forcibly warn them.
+        # DEBUG should also suppress to WARNING (default via None → {"default": "WARNING"}).
         for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
             logging.getLogger(name).setLevel(logging.NOTSET)
-        _suppress_noisy_third_party_loggers("DEBUG")
+        _suppress_noisy_third_party_loggers(LoggingConfig(log_level="DEBUG"))
         for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
-            assert logging.getLogger(name).level == logging.NOTSET
+            assert logging.getLogger(name).level == logging.WARNING
 
     def test_reconfigure_updates_buckets_and_resuppresses(self, reset_singletons, monkeypatch):
         """reconfigure_logging must move buckets to the new level and re-apply suppression."""
@@ -205,3 +292,57 @@ class TestThirdPartySuppression:
         assert motor_handlers.isdisjoint(root_handlers)
         # Buckets follow the new level.
         assert logging.getLogger("api_server").level == logging.DEBUG
+
+    def test_default_key_applies_to_all_third_party(self, reset_singletons):
+        """``{"default": "ERROR"}`` forces all known third-party loggers to ERROR."""
+        for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
+        _suppress_noisy_third_party_loggers(
+            LoggingConfig(log_level="INFO", third_party_log_levels={"default": "ERROR"})
+        )
+        for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
+            assert logging.getLogger(name).level == logging.ERROR
+
+    def test_default_with_specific_override(self, reset_singletons):
+        """Specific logger key overrides ``"default"``."""
+        for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
+        _suppress_noisy_third_party_loggers(
+            LoggingConfig(
+                log_level="INFO",
+                third_party_log_levels={
+                    "default": "WARNING",
+                    "httpx": "ERROR",
+                    "uvicorn.error": "DEBUG",
+                },
+            )
+        )
+        assert logging.getLogger("httpx").level == logging.ERROR
+        assert logging.getLogger("httpcore").level == logging.WARNING  # from default
+        assert logging.getLogger("urllib3").level == logging.WARNING  # from default
+        assert logging.getLogger("uvicorn.error").level == logging.DEBUG
+
+    def test_default_behavior_unchanged_when_none(self, reset_singletons):
+        """When ``third_party_log_levels`` is None, all discovered third-party loggers → WARNING."""
+        for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
+        _suppress_noisy_third_party_loggers(LoggingConfig(log_level="INFO", third_party_log_levels=None))
+        for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
+            assert logging.getLogger(name).level == logging.WARNING
+
+    def test_third_party_log_levels_applied_when_motor_debug(self, reset_singletons):
+        """When motor log_level is DEBUG, third_party_log_levels still takes effect."""
+        for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
+        _suppress_noisy_third_party_loggers(
+            LoggingConfig(
+                log_level="DEBUG",
+                third_party_log_levels={"default": "ERROR"},
+            )
+        )
+        for name in ("httpx", "httpcore", "urllib3", "uvicorn.error"):
+            assert logging.getLogger(name).level == logging.ERROR

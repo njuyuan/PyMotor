@@ -43,7 +43,7 @@ from motor.coordinator.router.upstream_error import (
 from motor.common.http.security_utils import (
     sanitize_error_message,
     filter_sensitive_headers,
-    filter_sensitive_body,
+    build_safe_body_structure,
     validate_and_sanitize_path,
 )
 from motor.common.logger import get_logger
@@ -102,7 +102,21 @@ def with_cancellation(handler_func):
     return wrapper
 
 
-async def select_router_class(scheduler, req_info: RequestInfo | None = None) -> type["BaseRouter"]:
+def _is_pd_hybrid_deploy(config: CoordinatorConfig | None) -> bool:
+    deploy_config = getattr(config, "deploy_config", None)
+    return getattr(deploy_config, "hybrid_instances_num", None) is not None
+
+
+def _is_pd_separation_fallback_to_hybrid_enabled(config: CoordinatorConfig | None) -> bool:
+    scheduler_config = getattr(config, "scheduler_config", None)
+    return bool(getattr(scheduler_config, "enable_pd_separation_fallback_to_hybrid", True))
+
+
+async def select_router_class(
+    scheduler,
+    req_info: RequestInfo | None = None,
+    config: CoordinatorConfig | None = None,
+) -> type["BaseRouter"]:
     """Select the router implementation from the live instance topology.
 
     Routing is derived from the roles currently present plus whether a P/D pair shares a
@@ -117,14 +131,48 @@ async def select_router_class(scheduler, req_info: RequestInfo | None = None) ->
     if has_pd_roles:
         compatibility_check = getattr(scheduler, "has_compatible_pd_pair", None)
         has_compatible_pair = await compatibility_check() if compatibility_check is not None else True
+        if has_compatible_pair:
+            # Check circuit breaker: only treat as compatible if there are
+            # non-blocked instances for BOTH roles
+            get_unblocked = getattr(scheduler, "get_unblocked_instances", None)
+            if get_unblocked is not None:
+                unblocked_p = await get_unblocked(PDRole.ROLE_P)
+                unblocked_d = await get_unblocked(PDRole.ROLE_D)
+                if not unblocked_p or not unblocked_d:
+                    has_compatible_pair = False
 
     if has_compatible_pair:
         return UnifiedPDRouter
-    if has_pd_roles and PDRole.ROLE_U not in roles:
+
+    # Degrade to hybrid mode if any unblocked instance is available
+    get_unblocked = getattr(scheduler, "get_unblocked_instances", None)
+    has_unblocked = False
+    if get_unblocked is not None:
+        for role in (PDRole.ROLE_U, PDRole.ROLE_P, PDRole.ROLE_D):
+            if await get_unblocked(role):
+                has_unblocked = True
+                break
+    else:
+        has_unblocked = PDRole.ROLE_U in roles or PDRole.ROLE_P in roles or PDRole.ROLE_D in roles
+
+    if not has_unblocked:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No compatible P/D dispatch capability is currently available",
+            detail="No routable inference topology is currently available: all instances are circuit-broken or absent",
         )
+
+    fallback_enabled = _is_pd_separation_fallback_to_hybrid_enabled(config)
+    is_hybrid_deploy = _is_pd_hybrid_deploy(config)
+    if not fallback_enabled and not is_hybrid_deploy:
+        if has_pd_roles:
+            message = "PD separate service has no compatible P/D pair and fallback to hybrid is disabled"
+        else:
+            message = "PD separate service is unavailable and fallback to hybrid is disabled"
+        if req_info is not None:
+            req_info.trace_obj.set_trace_error_message(message)
+        logger.warning("PD separate service cannot route request because hybrid fallback is disabled: %s", message)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=message)
+
     if PDRole.ROLE_U in roles or PDRole.ROLE_P in roles:
         if has_pd_roles and not has_compatible_pair and PDRole.ROLE_U in roles:
             message = (
@@ -135,6 +183,10 @@ async def select_router_class(scheduler, req_info: RequestInfo | None = None) ->
             if req_info is not None:
                 req_info.trace_obj.set_trace_error_message(message)
             logger.warning(message)
+        elif has_pd_roles and not has_compatible_pair and req_info is not None:
+            error_message = "PD separate service degraded to hybrid: P or D instances circuit-broken or incompatible"
+            req_info.trace_obj.set_trace_error_message(error_message)
+            logger.warning(error_message)
         elif req_info is not None and PDRole.ROLE_U not in roles:
             error_message = "PD separate service degraded to hybrid: only prefill instances available"
             req_info.trace_obj.set_trace_error_message(error_message)
@@ -178,7 +230,7 @@ async def handle_request(
             detail="Scheduler (SchedulingFacade) is required and must be injected by the server",
         )
 
-    router_impl_class = await select_router_class(scheduler, req_info=req_info)
+    router_impl_class = await select_router_class(scheduler, req_info=req_info, config=config)
 
     sampling_manager = getattr(raw_request.app.state, "sampling_manager", None)
     router_impl = router_impl_class(
@@ -233,7 +285,7 @@ async def __create_request_info(
     if not request_json:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty request json")
     filtered_headers = filter_sensitive_headers(raw_request.headers)
-    filtered_body = filter_sensitive_body(request_json)
+    filtered_body = build_safe_body_structure(request_json)
     logger.debug("Got request headers: %s, body: %s", filtered_headers, filtered_body)
     req_id = await request_manager.generate_request_id()
     req_len = len(request_body)

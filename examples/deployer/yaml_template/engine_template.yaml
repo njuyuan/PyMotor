@@ -14,8 +14,6 @@ spec:
       app: mindie-server
   template:
     metadata:
-      annotations:
-        sp-block: "xxxx"
       labels:
         fault-scheduling: grace
         fault-retry-times: "10000"
@@ -55,22 +53,17 @@ spec:
                 preStop:
                   exec:
                     command: ["bash", "-c", "$CONFIGMAP_PATH/prestop.sh"]
-          command: ["/bin/bash", "-c", "
-              source /mnt/configmap/boot.sh; \n
-          "]
+          command: ["/bin/bash", "-c", "source /mnt/configmap/boot.sh;"]
           resources:
             requests:
               memory: "64Gi"
               cpu: "16"
               huawei.com/Ascend910: 1
             limits:
-              memory: "256Gi"
-              cpu: "64"
               huawei.com/Ascend910: 1
           volumeMounts:
           - name: data
             mountPath: /data
-            readOnly: true
           - name: motor-config
             mountPath: /mnt/configmap
           - name: queue-schedule
@@ -89,8 +82,8 @@ spec:
             mountPath: /mnt/weight
           - name: plog-path
             mountPath: /root/ascend/log
-          - name: ascend-driver
-            mountPath: /usr/local/Ascend/driver
+          - name: driver-version
+            mountPath: /usr/local/Ascend/driver/version.info
           - name: rdma
             mountPath: /dev/infiniband
           - name: hisi-hdc
@@ -130,9 +123,10 @@ spec:
         hostPath:
           path: /root/ascend/log
           type: DirectoryOrCreate
-      - name: ascend-driver
+      - name: driver-version
         hostPath:
-          path: /usr/local/Ascend/driver
+          path: /usr/local/Ascend/driver/version.info
+          type: File
       - name: rdma
         hostPath:
           path: /dev/infiniband

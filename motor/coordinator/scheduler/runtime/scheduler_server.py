@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -17,9 +16,11 @@ Uses zmq.asyncio for fully async ZMQ I/O and avoids main-loop serialization bott
 import asyncio
 import os
 import time
+from collections import OrderedDict
 from typing import Awaitable, Callable
 
 import zmq.asyncio
+import msgspec
 
 from motor.common.resources.endpoint import Endpoint, WorkloadAction, Workload
 from motor.common.resources.http_msg_spec import EventType
@@ -28,6 +29,9 @@ from motor.common.logger import get_logger
 from motor.config.coordinator import CoordinatorConfig
 from motor.coordinator.domain import (
     UpdateWorkloadParams,
+)
+from motor.coordinator.domain.circuit_breaker import (
+    CircuitBreakerManager,
 )
 from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, REQUEST_ID_KEY
 from motor.coordinator.domain.instance_manager import InstanceManager
@@ -46,11 +50,14 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     KNOWN_CANDIDATE_POLICIES,
     INSTANCE_CHANGE_TOPIC,
+    CIRCUIT_BREAKER_TOPIC,
     pack_send_frames,
     unpack_recv_payload,
 )
 
 logger = get_logger(__name__)
+
+InstanceRefreshCallback = Callable[[EventType, list[Instance]], None | Awaitable[None]]
 
 
 def _create_workload_shared_memory(shared_memory_mod, shm_name: str, shm_size: int):
@@ -82,6 +89,15 @@ def _create_workload_shared_memory(shared_memory_mod, shm_name: str, shm_size: i
 # Hot-path scheduling log sampling: ~1% of requests to reduce I/O and CPU at high QPS
 _SCHEDULING_LOG_SAMPLE_RATE = 100
 
+# Upper bound on remembered UPDATE_WORKLOAD operation_ids used for retry de-duplication.
+# The store is a sliding window: once full, the oldest entry is evicted (FIFO), so memory is
+# capped at roughly _MAX * ~200 bytes instead of growing without bound. The cap must exceed the
+# number of distinct operations that can occur between an original request and its retry
+# (~ retry_timeout * peak_throughput); a retry whose id has already been evicted would be applied
+# a second time. No in-repo producer sets operation_id yet, so this stays empty until the
+# idempotency path is wired up.
+_MAX_COMMITTED_UPDATE_WORKLOAD_OPERATIONS = 100_000
+
 # Display string for unknown/hybrid role in logs
 _ROLE_DISPLAY_HYBRID = "hybrid"
 
@@ -90,6 +106,10 @@ _KEY_INSTANCE = "instance"
 _KEY_ENDPOINT = "endpoint"
 _KEY_SELECTED_SCORE = "selected_score"
 _KEY_WORKLOAD_SEQUENCE = "workload_sequence"
+_KEY_ROLE_WORKLOAD_SEQUENCE = "role_workload_sequence"
+# Allocation demand sent as two raw floats (keys must match the client literals in scheduler_client).
+_KEY_WORKLOAD_ACTIVE_TOKENS = "workload_active_tokens"
+_KEY_WORKLOAD_ACTIVE_KV_CACHE = "workload_active_kv_cache"
 _KEY_INSTANCE_VERSION = "instance_version"
 _KEY_FAST_PATH = "fast_path"
 _KEY_CANDIDATE_POLICY = "candidate_policy"
@@ -168,14 +188,21 @@ class _SchedulerRequestDispatcher:
         scheduler: Scheduler,
         config: CoordinatorConfig,
         workload_writer: WorkloadSharedMemoryWriter | None = None,
-        on_instance_refresh_done: Callable[[], None | Awaitable[None]] | None = None,
+        on_instance_refresh_done: InstanceRefreshCallback | None = None,
+        circuit_breaker_manager: CircuitBreakerManager | None = None,
+        pub_socket: zmq.asyncio.Socket | None = None,
     ):
         self._instance_manager = instance_manager
         self._scheduler = scheduler
         self._config = config
         self._workload_writer = workload_writer
         self._on_instance_refresh_done = on_instance_refresh_done
+        self._cb_manager = circuit_breaker_manager or CircuitBreakerManager()
+        self._pub_socket = pub_socket
+        self._recovery_timers: dict[int, asyncio.Task] = {}
         self._workload_commit_lock = asyncio.Lock()
+        # Bounded FIFO of committed operation_ids for retry de-dup (oldest evicted when full).
+        self._committed_update_workload_operations: "OrderedDict[str, None]" = OrderedDict()
         self._endpoint_instance_score_weight = max(
             0.0,
             getattr(config.scheduler_config, "endpoint_instance_score_weight", 0.05),
@@ -194,6 +221,7 @@ class _SchedulerRequestDispatcher:
             SchedulerRequestType.CONFIRM_SAMPLE.value: self._handle_confirm_sample,
             SchedulerRequestType.RECORD_PRECISION_RESULT.value: self._handle_record_precision_result,
             SchedulerRequestType.FINISH_PRECISION_ACTION.value: self._handle_finish_precision_action,
+            SchedulerRequestType.CIRCUIT_BREAKER_REPORT.value: self._handle_circuit_breaker_report,
         }
         handler = handlers.get(request.request_type)
         if handler:
@@ -212,6 +240,7 @@ class _SchedulerRequestDispatcher:
         endpoint_id = request.data.get("endpoint_id")
         role_str = request.data.get("role")
         req_id = request.data.get("req_id")
+        operation_id = request.data.get("operation_id")
         workload_action_str = request.data.get("workload_action")
         workload_change_data = request.data.get("workload_change")
 
@@ -244,16 +273,65 @@ class _SchedulerRequestDispatcher:
             req_id=req_id or "",
             workload_action=workload_action,
             workload_change=workload_change,
+            operation_id=str(operation_id) if operation_id else None,
         )
-        async with self._workload_commit_lock:
-            success = await self._scheduler.update_workload(params)
-            if success and self._workload_writer:
-                await self._workload_writer.write_single_entry(int(instance_id), int(endpoint_id))
+        if params.operation_id and params.operation_id in self._committed_update_workload_operations:
+            if self._workload_writer:
+                self._workload_writer.write_single_entry_sync(int(instance_id), int(endpoint_id))
+            logger.info(
+                "UPDATE_WORKLOAD idempotent replay operation_id=%s instance_id=%s endpoint_id=%s "
+                "req_id=%s action=%s scheduler_request_id=%s",
+                params.operation_id,
+                instance_id,
+                endpoint_id,
+                req_id or "",
+                workload_action.value,
+                request.request_id,
+            )
+            return SchedulerResponse(
+                response_type=SchedulerResponseType.SUCCESS,
+                request_id=request.request_id,
+                data={"success": True, "idempotent": True},
+            )
+        success, updated_role, updated_workload = self._scheduler.update_workload_sync(params)
+        if success and params.operation_id:
+            self._remember_committed_operation(params.operation_id)
+        if success:
+            self._write_workload_entry(int(instance_id), int(endpoint_id), updated_role, updated_workload)
         return SchedulerResponse(
             response_type=SchedulerResponseType.SUCCESS,
             request_id=request.request_id,
             data={"success": success},
         )
+
+    def _write_workload_entry(
+        self,
+        instance_id: int,
+        endpoint_id: int,
+        role: PDRole | None,
+        workload: Workload | None,
+    ) -> None:
+        """Publish an endpoint's committed workload to SHM.
+
+        A None workload means the scheduling policy does not track workload (no update_workload_sync),
+        so re-read the authoritative absolute from the ledger instead of writing the caller's delta
+        as if it were the endpoint total.
+        """
+        if not self._workload_writer:
+            return
+        if workload is not None:
+            self._workload_writer.write_single_entry_from_workload(instance_id, endpoint_id, role, workload)
+        else:
+            self._workload_writer.write_single_entry_sync(instance_id, endpoint_id)
+
+    def _remember_committed_operation(self, operation_id: str) -> None:
+        """Record a committed operation_id for retry de-dup, evicting the oldest once the cap is hit."""
+        ops = self._committed_update_workload_operations
+        if operation_id in ops:
+            return
+        ops[operation_id] = None
+        if len(ops) > _MAX_COMMITTED_UPDATE_WORKLOAD_OPERATIONS:
+            ops.popitem(last=False)
 
     def _handle_get_available_instances(self, request: SchedulerRequest) -> SchedulerResponse:
         role_str = request.data.get("role")
@@ -283,18 +361,33 @@ class _SchedulerRequestDispatcher:
                 request_id=request.request_id,
                 error=f"Invalid event type: {event_type_str}",
             )
+        previously_open_ids: list[int] = []
         async with self._workload_commit_lock:
             changed = await self._instance_manager.refresh_instances(event_type, instances)
+            if event_type == EventType.SET:
+                # Snapshot open instances before clearing so workers can be notified.
+                previously_open_ids = self._cb_manager.get_open_instance_ids()
+                self._cb_manager.clear_all()
+                for key, task in list(self._recovery_timers.items()):
+                    if not task.done():
+                        task.cancel()
+                    self._recovery_timers.pop(key, None)
+            elif event_type == EventType.DEL:
+                for inst in instances:
+                    self._cb_manager.clear_instance(inst.id)
+                    self._cancel_recovery(inst.id)
             if changed and self._workload_writer:
                 self._workload_writer.write_snapshot()
         if changed:
             if self._on_instance_refresh_done:
                 try:
-                    result = self._on_instance_refresh_done()
+                    result = self._on_instance_refresh_done(event_type, instances)
                     if asyncio.iscoroutine(result):
                         await result
                 except Exception as e:
                     logger.warning("Failed to publish instance change: %s", e)
+        for iid in previously_open_ids:
+            asyncio.create_task(self._publish_circuit_breaker(iid, "closed"))
         return SchedulerResponse(
             response_type=SchedulerResponseType.SUCCESS,
             request_id=request.request_id,
@@ -439,6 +532,41 @@ class _SchedulerRequestDispatcher:
             data={"finished": ok},
         )
 
+    async def _handle_circuit_breaker_report(self, request: SchedulerRequest) -> SchedulerResponse:
+        instance_id = request.data.get("instance_id")
+        event = request.data.get("event")
+
+        if instance_id is None:
+            return SchedulerResponse(
+                response_type=SchedulerResponseType.ERROR,
+                request_id=request.request_id,
+                error="Missing instance_id in circuit breaker report",
+            )
+        instance_id = int(instance_id)
+
+        if event == "failure":
+            should_trip, timeout = self._cb_manager.process_failure(instance_id)
+            if should_trip:
+                self._schedule_recovery(instance_id, timeout)
+                await self._publish_circuit_breaker(instance_id, "open")
+        elif event == "success":
+            recovered = self._cb_manager.process_success(instance_id)
+            if recovered:
+                self._cancel_recovery(instance_id)
+                await self._publish_circuit_breaker(instance_id, "closed")
+        else:
+            return SchedulerResponse(
+                response_type=SchedulerResponseType.ERROR,
+                request_id=request.request_id,
+                error=f"Unknown circuit breaker event: {event}",
+            )
+
+        return SchedulerResponse(
+            response_type=SchedulerResponseType.SUCCESS,
+            request_id=request.request_id,
+            data={},
+        )
+
     async def _handle_allocate_only(self, request: SchedulerRequest) -> SchedulerResponse:
         """
         Worker proposes one endpoint; Scheduler authoritatively commits one workload allocation.
@@ -447,8 +575,11 @@ class _SchedulerRequestDispatcher:
         endpoint_id = request.data.get("endpoint_id")
         req_id = request.data.get("req_id", "")
         workload_data = request.data.get("workload")
+        workload_active_tokens = request.data.get(_KEY_WORKLOAD_ACTIVE_TOKENS)
+        workload_active_kv_cache = request.data.get(_KEY_WORKLOAD_ACTIVE_KV_CACHE)
         role_str = request.data.get("role")
         worker_workload_sequence = self._parse_optional_int(request.data.get(_KEY_WORKLOAD_SEQUENCE))
+        worker_role_workload_sequence = self._parse_optional_int(request.data.get(_KEY_ROLE_WORKLOAD_SEQUENCE))
         worker_instance_version = self._parse_optional_int(request.data.get(_KEY_INSTANCE_VERSION))
         candidate_policy = request.data.get(_KEY_CANDIDATE_POLICY)
         worker_load_weight = self._parse_optional_float(request.data.get(_KEY_LOAD_WEIGHT))
@@ -460,14 +591,21 @@ class _SchedulerRequestDispatcher:
                 request_id=request.request_id,
                 error="Missing instance_id or endpoint_id in request data",
             )
-        if not workload_data:
+        if workload_active_tokens is None and workload_active_kv_cache is None and not workload_data:
             return SchedulerResponse(
                 response_type=SchedulerResponseType.ERROR,
                 request_id=request.request_id,
                 error="Missing workload in request data",
             )
         try:
-            workload = Workload.model_validate(workload_data)
+            if workload_active_tokens is not None or workload_active_kv_cache is not None:
+                workload = Workload(
+                    active_tokens=float(workload_active_tokens or 0.0),
+                    active_kv_cache=float(workload_active_kv_cache or 0.0),
+                )
+            else:
+                # Legacy wire format: full Workload dict from an older client.
+                workload = Workload.model_validate(workload_data)
         except Exception as e:
             return SchedulerResponse(
                 response_type=SchedulerResponseType.ERROR,
@@ -494,58 +632,59 @@ class _SchedulerRequestDispatcher:
         # kv_cache_affinity unified mode: every endpoint with its affinity-discounted prefill cost,
         # for a global re-rank by the scheduler's fresh load. Empty for other policies/modes.
         affinity_candidates = self._extract_affinity_candidates(request.data)
-        async with self._workload_commit_lock:
-            fast_path = self._can_use_worker_top1_fast_path(
-                worker_workload_sequence,
-                worker_instance_version,
+        fast_path = self._can_use_worker_top1_fast_path(
+            worker_workload_sequence,
+            worker_role_workload_sequence,
+            worker_instance_version,
+            role,
+        )
+        selected = (
+            self._select_valid_candidate(selected_candidate, role)
+            if fast_path
+            else self._select_authoritative_allocate_candidate(
+                selected_candidate,
+                selected_candidates,
+                role,
+                candidate_policy,
+                affinity_candidates,
+                worker_prefill_load_scale,
+                worker_load_weight,
             )
-            selected = (
-                self._select_valid_candidate(selected_candidate, role)
-                if fast_path
-                else self._select_authoritative_allocate_candidate(
-                    selected_candidate,
-                    selected_candidates,
-                    role,
-                    candidate_policy,
-                    affinity_candidates,
-                    worker_prefill_load_scale,
-                    worker_load_weight,
-                )
+        )
+        if fast_path and selected is None:
+            selected = self._select_authoritative_allocate_candidate(
+                selected_candidate,
+                selected_candidates,
+                role,
+                candidate_policy,
+                affinity_candidates,
+                worker_prefill_load_scale,
+                worker_load_weight,
             )
-            if fast_path and selected is None:
-                selected = self._select_authoritative_allocate_candidate(
-                    selected_candidate,
-                    selected_candidates,
-                    role,
-                    candidate_policy,
-                    affinity_candidates,
-                    worker_prefill_load_scale,
-                    worker_load_weight,
-                )
-                fast_path = False
-            if selected is None:
-                logger.warning(
-                    "ALLOCATE_ONLY endpoint unavailable req_id=%s candidate=%s",
-                    req_id,
-                    selected_candidate,
-                )
-                return SchedulerResponse(
-                    response_type=SchedulerResponseType.SUCCESS,
-                    request_id=request.request_id,
-                    data={_KEY_INSTANCE: None, _KEY_ENDPOINT: None},
-                )
-            instance, endpoint, selected_score = selected
-            params = UpdateWorkloadParams(
-                instance_id=instance.id,
-                endpoint_id=endpoint.id,
-                role=role,
-                req_id=req_id,
-                workload_action=WorkloadAction.ALLOCATION,
-                workload_change=workload,
+            fast_path = False
+        if selected is None:
+            logger.warning(
+                "ALLOCATE_ONLY endpoint unavailable req_id=%s candidate=%s",
+                req_id,
+                selected_candidate,
             )
-            success = await self._scheduler.update_workload(params)
-            if success and self._workload_writer:
-                await self._workload_writer.write_single_entry(instance.id, endpoint.id)
+            return SchedulerResponse(
+                response_type=SchedulerResponseType.SUCCESS,
+                request_id=request.request_id,
+                data={_KEY_INSTANCE: None, _KEY_ENDPOINT: None},
+            )
+        instance, endpoint, selected_score = selected
+        params = UpdateWorkloadParams(
+            instance_id=instance.id,
+            endpoint_id=endpoint.id,
+            role=role,
+            req_id=req_id,
+            workload_action=WorkloadAction.ALLOCATION,
+            workload_change=workload,
+        )
+        success, updated_role, updated_workload = self._scheduler.update_workload_sync(params)
+        if success:
+            self._write_workload_entry(instance.id, endpoint.id, updated_role, updated_workload)
 
         if not success:
             return SchedulerResponse(
@@ -715,6 +854,8 @@ class _SchedulerRequestDispatcher:
         lweight = load_weight if load_weight is not None else 1.0
         best: tuple[Instance, Endpoint, float, float] | None = None  # (..., combined, prefill_cost)
         for instance_id, endpoint_id, prefill_cost in affinity_candidates:
+            if self._is_instance_circuit_open(instance_id):
+                continue
             found = self._find_available_instance_endpoint(instance_id, endpoint_id)
             if found is None:
                 continue
@@ -761,6 +902,8 @@ class _SchedulerRequestDispatcher:
         """
         best: tuple[Instance, Endpoint, float] | None = None
         for cand in candidates:
+            if self._is_instance_circuit_open(cand[0]):
+                continue
             found = self._find_available_instance_endpoint(*cand)
             if found is None:
                 continue
@@ -805,17 +948,79 @@ class _SchedulerRequestDispatcher:
             )
         return self._is_load_balance_scheduler
 
+    # ------------------------------------------------------------------
+    # Circuit breaker helpers
+    # ------------------------------------------------------------------
+
+    def _is_instance_circuit_open(self, instance_id: int) -> bool:
+        """Check if an instance is currently circuit-broken (blocked from scheduling)."""
+        return self._cb_manager.is_open(instance_id)
+
+    def _schedule_recovery(self, instance_id: int, timeout: float) -> None:
+        """Schedule an auto-recovery timer for a tripped instance."""
+        key = instance_id
+        if key in self._recovery_timers:
+            self._recovery_timers[key].cancel()
+        task = asyncio.create_task(self._auto_recover(instance_id, timeout))
+        self._recovery_timers[key] = task
+
+    async def _auto_recover(self, instance_id: int, timeout: float) -> None:
+        """Recovery timer callback. Resets the instance to closed after timeout."""
+        try:
+            await asyncio.sleep(timeout)
+        except asyncio.CancelledError:
+            return
+        try:
+            recovered = self._cb_manager.auto_recover(instance_id)
+            if recovered:
+                await self._publish_circuit_breaker(instance_id, "closed")
+        finally:
+            # Only remove our own entry: a concurrent _schedule_recovery may have
+            # already replaced _recovery_timers[instance_id] with a new task before
+            # this finally block runs (race window inside _publish_circuit_breaker).
+            if self._recovery_timers.get(instance_id) is asyncio.current_task():
+                self._recovery_timers.pop(instance_id, None)
+
+    def _cancel_recovery(self, instance_id: int) -> None:
+        """Cancel a pending recovery timer for an instance."""
+        key = instance_id
+        task = self._recovery_timers.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _publish_circuit_breaker(self, instance_id: int, state: str) -> None:
+        """Publish circuit breaker state change to PUB subscribers."""
+        if not self._pub_socket:
+            return
+        payload = {
+            "instance_id": instance_id,
+            "state": state,
+        }
+        try:
+            await self._pub_socket.send_multipart([CIRCUIT_BREAKER_TOPIC, msgspec.msgpack.encode(payload)])
+        except Exception as e:
+            logger.warning(
+                "Failed to publish circuit breaker change: instance_id=%d error=%s",
+                instance_id,
+                e,
+            )
+
     def _select_global_load_balance_candidate(
         self,
         role: PDRole,
     ) -> tuple[Instance, Endpoint, float] | None:
-        """Select the globally lowest-score endpoint for role from SchedulerServer's local pool."""
+        """Select the globally lowest-score endpoint for role from SchedulerServer's local pool.
+
+        Circuit-broken endpoints are filtered so the authoritative re-scan never picks one
+        that the local PUB cache may not yet know about.
+        """
         instances = self._instance_manager.get_available_instances(role).values()
         candidates = LoadBalancePolicy.select_endpoint_candidates_from_list(
             instances,
             role=role,
             top_k=1,
             instance_score_weight=self._endpoint_instance_score_weight,
+            is_blocked=self._is_instance_circuit_open,
         )
         if not candidates:
             return None
@@ -825,11 +1030,24 @@ class _SchedulerRequestDispatcher:
     def _can_use_worker_top1_fast_path(
         self,
         worker_workload_sequence: int | None,
+        worker_role_workload_sequence: int | None,
         worker_instance_version: int | None,
+        role: PDRole | None,
     ) -> bool:
         """Return True when worker selected from the exact SchedulerServer workload view."""
         if not self._workload_writer:
             return False
+        scheduler_role_sequence = (
+            self._workload_writer.role_sequence(role)
+            if role is not None and hasattr(self._workload_writer, "role_sequence")
+            else None
+        )
+        if scheduler_role_sequence is not None and worker_role_workload_sequence is not None:
+            return (
+                worker_instance_version is not None
+                and worker_role_workload_sequence == scheduler_role_sequence
+                and worker_instance_version == self._workload_writer.instance_version
+            )
         return (
             worker_workload_sequence is not None
             and worker_instance_version is not None
@@ -849,6 +1067,8 @@ class _SchedulerRequestDispatcher:
         only validates the worker-selected endpoint.
         """
         instance_id, endpoint_id = candidate
+        if self._is_instance_circuit_open(instance_id):
+            return None
         found = self._find_available_instance_endpoint(instance_id, endpoint_id)
         if found is None:
             return None
@@ -988,6 +1208,7 @@ class AsyncSchedulerServer:
         self._workload_writer: WorkloadSharedMemoryWriter | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._pub_socket: zmq.asyncio.Socket | None = None
+        self._cb_manager: CircuitBreakerManager | None = None
 
     async def stop(self):
         """Stop the async server."""
@@ -1028,12 +1249,21 @@ class AsyncSchedulerServer:
             except Exception as e:
                 logger.warning("Error closing workload shared memory: %s", e)
             self._workload_shm = None
+        if self._dispatcher is not None:
+            for key, task in list(self._dispatcher._recovery_timers.items()):
+                if not task.done():
+                    task.cancel()
+            self._dispatcher._recovery_timers.clear()
         if self._pub_socket:
             try:
                 self._pub_socket.close()
             except Exception as e:
                 logger.warning("Error closing instance PUB socket: %s", e)
             self._pub_socket = None
+        if self._cb_manager:
+            count = self._cb_manager.clear_all()
+            if count:
+                logger.info("Circuit breaker pool cleared on shutdown: count=%d", count)
         if self._transport:
             await self._transport.disconnect()
         if self.context:
@@ -1077,12 +1307,16 @@ class AsyncSchedulerServer:
 
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
+        self._cb_manager = CircuitBreakerManager()
+
         self._dispatcher = _SchedulerRequestDispatcher(
             self.instance_manager,
             self.scheduler,
             self.config,
             workload_writer=self._workload_writer,
             on_instance_refresh_done=self._publish_instance_changed,
+            circuit_breaker_manager=self._cb_manager,
+            pub_socket=self._pub_socket,
         )
 
         logger.info("Async scheduler server started, frontend: %s", self.frontend_address)
@@ -1095,15 +1329,34 @@ class AsyncSchedulerServer:
         finally:
             await self.stop()
 
-    async def _publish_instance_changed(self) -> None:
-        """Publish instance list changed + version to SUB clients (no-op if PUB not enabled)."""
+    async def _publish_instance_changed(self, event_type=None, instances=None) -> None:
+        """Publish instance list changed + version to SUB clients (no-op if PUB not enabled).
+
+        For ADD/DEL a third msgpack frame carries the changed instances so workers patch their cache
+        incrementally instead of each doing a full GET; other events (SET/PAUSE/RESUME) omit it and
+        workers fall back to a full pull. The frame is additive -- older workers ignore it.
+        """
         if not self._pub_socket:
             return
         version = self._workload_writer.instance_version if self._workload_writer else 0
+        frames: list[bytes] = [INSTANCE_CHANGE_TOPIC, str(version).encode()]
+        delta = self._build_instance_delta(event_type, instances)
+        if delta is not None:
+            frames.append(msgspec.msgpack.encode(delta))
         try:
-            await self._pub_socket.send_multipart([INSTANCE_CHANGE_TOPIC, str(version).encode()])
+            await self._pub_socket.send_multipart(frames)
         except Exception as e:
             logger.warning("Failed to publish instance change: %s", e)
+
+    @staticmethod
+    def _build_instance_delta(event_type, instances):
+        """Build the incremental PUB delta for ADD/DEL; None for events workers don't patch (SET/…)."""
+        if event_type not in (EventType.ADD, EventType.DEL) or not instances:
+            return None
+        return {
+            "event": "add" if event_type == EventType.ADD else "del",
+            "instances": [_instance_to_dict(inst) for inst in instances],
+        }
 
     async def _heartbeat_loop(self) -> None:
         """Write heartbeat to shm every 1s so Infer can detect Scheduler restart (stale = no change)."""

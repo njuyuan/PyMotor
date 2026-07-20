@@ -63,6 +63,7 @@ KV_CONNECTOR_EXTRA_CONFIG_KEY = "kv_connector_extra_config"
 CONNECTORS_KEY = "connectors"
 KV_PORT_KEY = "kv_port"
 LOOPUP_RPC_PORT_KEY = "lookup_rpc_port"
+UCM_CONNECTOR = "UCMConnector"
 SERVER_LIST = "server_list"
 DEVICE = "device"
 HARDWARE_TYPE_KEY = "hardware_type"
@@ -172,6 +173,26 @@ class SingleContainerNodemanagerConfig:
             return config
 
         config.single_container_flag = True
+        index = int(Env.index)
+
+        union_section = user_config_data.get(MOTOR_ENGINE_UNION_CONFIG_KEY)
+        prefill_section = user_config_data.get(MOTOR_ENGINE_PREFILL_CONFIG_KEY)
+        if union_section and not prefill_section:
+            if Env.role != "union":
+                return config
+
+            union_resolver = ConfigResolver(union_section)
+            union_parallel_config = union_resolver.get_parallel_config()
+            u_dp_size = union_parallel_config.get(DP, 1)
+            u_world_size = union_parallel_config["world_size"]
+
+            config.node_manager_port_offset = index
+            config.base_port_offset = index * u_dp_size * 2
+            config.device_offset = index * u_world_size
+            config.device_num = u_world_size
+            config.dp_rpc_port = int(union_parallel_config["dp_rpc_port"]) + index
+            return config
+
         p_instances_num = user_config_data['motor_deploy_config']['p_instances_num']
         d_instances_num = user_config_data['motor_deploy_config']['d_instances_num']
         encode_section = user_config_data.get(MOTOR_ENGINE_ENCODE_CONFIG_KEY, {})
@@ -189,8 +210,6 @@ class SingleContainerNodemanagerConfig:
         e_world_size = encode_parallel_config.get("world_size", 0)
         p_world_size = prefill_parallel_config["world_size"]
         d_world_size = decode_parallel_config["world_size"]
-
-        index = int(Env.index)
 
         d_node_manager_port_offset = p_instances_num * p_dp_size + index
         d_base_port_offset = (p_instances_num * p_dp_size + index * d_dp_size) * 2
@@ -232,9 +251,27 @@ class SingleContainerNodemanagerConfig:
         kv_config = user_config_data[MOTOR_ENGINE_PREFILL_CONFIG_KEY][ENGINE_CONFIG_KEY].get(KV_TRANSFER_CONFIG_KEY, {})
         if kv_config:
             if kv_config[KV_CONNECTOR_KEY] == MULTICONNECTOR:
-                connectors = kv_config[KV_CONNECTOR_EXTRA_CONFIG_KEY][CONNECTORS_KEY]
+                extra_config = kv_config.get(KV_CONNECTOR_EXTRA_CONFIG_KEY)
+                connectors = extra_config.get(CONNECTORS_KEY) if isinstance(extra_config, dict) else None
+                if not isinstance(connectors, list) or len(connectors) < 2:
+                    raise ValueError(
+                        f"{KV_TRANSFER_CONFIG_KEY}.{KV_CONNECTOR_EXTRA_CONFIG_KEY}.{CONNECTORS_KEY} "
+                        f"must be a list of at least 2 connectors (transport first, store second) "
+                        f"when {KV_CONNECTOR_KEY} is {MULTICONNECTOR}"
+                    )
+                if not all(isinstance(connector, dict) for connector in connectors[:2]):
+                    raise ValueError(
+                        f"{KV_TRANSFER_CONFIG_KEY}.{KV_CONNECTOR_EXTRA_CONFIG_KEY}.{CONNECTORS_KEY} "
+                        "entries must be objects (connector configs)"
+                    )
                 config.kv_port = int(connectors[0][KV_PORT_KEY]) + kv_port_offset
-                config.lookup_rpc_port = int(connectors[1][LOOPUP_RPC_PORT_KEY]) + lookup_rpc_port_offset
+                store = connectors[1]
+                # UCM store carries no lookup_rpc_port. Skip ONLY UCM (use .get() to avoid a
+                # KeyError on the kv_connector lookup); every other store still direct-indexes
+                # lookup_rpc_port, so a genuine AscendStore missing its port fails fast exactly
+                # as before instead of being silently skipped.
+                if store.get(KV_CONNECTOR_KEY) != UCM_CONNECTOR:
+                    config.lookup_rpc_port = int(store[LOOPUP_RPC_PORT_KEY]) + lookup_rpc_port_offset
             else:
                 config.kv_port = int(kv_config[KV_PORT_KEY]) + kv_port_offset
 
@@ -252,6 +289,20 @@ class NodeManagerFaultToleranceConfig:
 
 
 @dataclass
+class KVCacheStoreConfig:
+    """KV cache store configuration — parsed from ``kv_cache_store_config``."""
+
+    enable: bool = False  # True when kv_cache_store_config is present
+    backend: str = "memcache"
+    service: str = ""  # default from $KVS_MASTER_SERVICE
+    local_service_mode: str = ""  # "standalone" / "inprocess"
+    dram_size: str = ""  # e.g. "100GB"
+    port: int = 50088  # RPC port
+    config_store_port: int = 50089  # ConfigStore TCP port
+    local_config_path: str = "/usr/local/Ascend/pyMotor/conf/mmc-local.conf"
+
+
+@dataclass
 class NodeManagerConfig:
     """Global configuration singleton for node manager"""
 
@@ -265,6 +316,7 @@ class NodeManagerConfig:
     single_container_config: SingleContainerNodemanagerConfig = field(default_factory=SingleContainerNodemanagerConfig)
     fault_tolerance_config: NodeManagerFaultToleranceConfig = field(default_factory=NodeManagerFaultToleranceConfig)
     port_allocator_config: PortAllocatorConfig = field(default_factory=PortAllocatorConfig)
+    kv_cache_store_config: KVCacheStoreConfig = field(default_factory=KVCacheStoreConfig)
 
     # Internal fields
     config_path: str | None = field(default=None, init=False)
@@ -318,6 +370,7 @@ class NodeManagerConfig:
             logger.warning("Config file does not exist, using default configuration: %s", config_path_obj)
 
         cls._set_device_count_from_config(config, raw)
+        cls._parse_kv_cache_store_config(config, raw)
 
         config.validate_config()
 
@@ -540,6 +593,47 @@ class NodeManagerConfig:
             config.endpoint_config.mgmt_ports = []
 
     @classmethod
+    def _parse_kv_cache_store_config(cls, config: "NodeManagerConfig", raw: dict | None):
+        """Populate ``kv_cache_store_config`` from ``user_config.json``.
+
+        Env vars serve as fallback for values only the deployer provides.
+        When the config section is missing, env vars alone can enable KV store.
+        """
+        if not isinstance(raw, dict):
+            raw = {}
+        kv = raw.get("kv_cache_store_config", {})
+        if not isinstance(kv, dict):
+            kv = {}
+        kcfg = config.kv_cache_store_config
+
+        # --- enable: config section or deployer-injected env var ---
+        if kv or os.getenv("KV_STORE_BACKEND", ""):
+            kcfg.enable = True
+
+        # --- populate from config first, env var as fallback ---
+        if "backend" in kv:
+            kcfg.backend = kv["backend"]
+        if not kcfg.service:
+            kcfg.service = kv.get("service", "") or os.getenv("KVS_MASTER_SERVICE", "")
+        if not kcfg.local_service_mode:
+            kcfg.local_service_mode = kv.get("local_service_mode", "") or os.getenv("MMC_LOCAL_SERVICE_MODE", "")
+        if not kcfg.dram_size:
+            kcfg.dram_size = kv.get("dram_size", "") or os.getenv("MMC_DRAM_SIZE", "")
+        port = kv.get("port", 0)
+        if port:
+            kcfg.port = int(port)
+        elif not kcfg.port or kcfg.port == 50088:
+            env_port = os.getenv("KV_CACHE_STORE_PORT", "")
+            if env_port:
+                kcfg.port = int(env_port)
+        cs_port = kv.get("config_store_port", 0)
+        if cs_port:
+            kcfg.config_store_port = int(cs_port)
+        config_path = kv.get("local_config_path", "") or os.getenv("MMC_LOCAL_CONFIG_PATH", "")
+        if config_path:
+            kcfg.local_config_path = config_path
+
+    @classmethod
     def _set_device_count_for_single_container(cls, config: "NodeManagerConfig"):
         """Set device count for single container mode using parallel_config.world_size"""
         device_count = config.basic_config.parallel_config.world_size
@@ -710,5 +804,15 @@ class NodeManagerConfig:
             f"    ├─ EP Size:          EP={self.basic_config.parallel_config.ep_size}\n"
             f"    ├─ PCP Size:         PCP={self.basic_config.parallel_config.pcp_size}\n"
             f"    └─ World Size:       World Size={self.basic_config.parallel_config.world_size}\n"
+            "\n"
+            "  KV Cache Store Configuration:\n"
+            f"    ├─ Enabled:              {self.kv_cache_store_config.enable}\n"
+            f"    ├─ Backend:              {self.kv_cache_store_config.backend}\n"
+            f"    ├─ Service:              {self.kv_cache_store_config.service or '(env: KVS_MASTER_SERVICE)'}\n"
+            f"    ├─ Mode:                 {self.kv_cache_store_config.local_service_mode or '(default)'}\n"
+            f"    ├─ DRAM Size:            {self.kv_cache_store_config.dram_size or '(default)'}\n"
+            f"    ├─ Port:                 {self.kv_cache_store_config.port}\n"
+            f"    ├─ ConfigStore Port:     {self.kv_cache_store_config.config_store_port}\n"
+            f"    └─ Local Config Path:    {self.kv_cache_store_config.local_config_path}\n"
             f"{'=' * 80}"
         )

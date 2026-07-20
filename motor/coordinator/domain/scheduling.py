@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -16,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Protocol, Tuple
+from typing import Iterable, Protocol
 
 from pydantic import BaseModel
 
@@ -100,14 +99,6 @@ class ScheduledResource(BaseModel):
 
 
 @dataclass(frozen=True)
-class ScheduledPair:
-    prefill: ScheduledResource
-    decode: ScheduledResource
-    prefill_workload: Workload
-    decode_workload: Workload
-
-
-@dataclass(frozen=True)
 class UpdateWorkloadParams:
     """
     Parameters for update_workload (G.FNM.03: encapsulate many related args).
@@ -119,34 +110,7 @@ class UpdateWorkloadParams:
     req_id: str
     workload_action: WorkloadAction
     workload_change: Workload
-
-
-def build_release_workload_params(
-    instance_id: int,
-    endpoint_id: int,
-    role: PDRole,
-    req_id: str,
-    workload: Workload,
-) -> tuple[UpdateWorkloadParams, UpdateWorkloadParams]:
-    """Build token and KV releases that compensate one allocation."""
-    common = {
-        "instance_id": instance_id,
-        "endpoint_id": endpoint_id,
-        "role": role,
-        "req_id": req_id,
-    }
-    return (
-        UpdateWorkloadParams(
-            **common,
-            workload_action=WorkloadAction.RELEASE_TOKENS,
-            workload_change=Workload(active_tokens=-workload.active_tokens),
-        ),
-        UpdateWorkloadParams(
-            **common,
-            workload_action=WorkloadAction.RELEASE_KV,
-            workload_change=Workload(active_kv_cache=-workload.active_kv_cache),
-        ),
-    )
+    operation_id: str | None = None
 
 
 class SchedulingFacade(Protocol):
@@ -162,19 +126,12 @@ class SchedulingFacade(Protocol):
         req_info: RequestInfo,
         *,
         target_instance_id: int | None = None,
-    ) -> Tuple[Instance, Endpoint, Workload] | None:
+    ) -> tuple[Instance, Endpoint, Workload] | None:
         """
         Atomic: select instance + one workload allocation (ALLOCATION).
         When target_instance_id is set, pin to that instance (skip policy selection).
         Returns (instance, endpoint, allocation_workload). Caller records allocation_workload for release.
         """
-        ...
-
-    async def select_pair_and_allocate(
-        self,
-        req_info: RequestInfo,
-    ) -> ScheduledPair | None:
-        """Select and allocate a P/D pair as one scheduling operation."""
         ...
 
     async def update_workload(self, params: UpdateWorkloadParams) -> bool:
@@ -198,4 +155,16 @@ class SchedulingFacade(Protocol):
 
     async def has_compatible_pd_pair(self) -> bool:
         """Return whether the local scheduler view contains a compatible P/D pair."""
+        ...
+
+    async def report_cb_event(self, instance_id: int, event: str) -> None:
+        """Report a circuit-breaker event ("failure" | "success") for an instance.
+
+        Implementations that run alongside SchedulerServer forward the event via
+        ZMQ; in-process implementations may be a no-op.
+        """
+        ...
+
+    async def get_unblocked_instances(self, role: PDRole) -> list[int]:
+        """Return instance IDs of the given role that are NOT blocked by circuit breaker."""
         ...

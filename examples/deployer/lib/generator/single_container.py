@@ -8,6 +8,8 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
+import os
+
 import lib.constant as C
 from lib.utils import generate_unique_id, load_yaml, write_yaml, logger
 from lib.generator import k8s_utils
@@ -18,7 +20,13 @@ from lib.generator.engine import (
     apply_a5_workload,
     apply_a5_engine_pod_config,
 )
-from lib.generator.kv_pool import normalize_kv_cache_pool_config, gen_kv_pool_env
+from lib.generator.kv_cache_store import normalize_kv_cache_store_config, gen_kv_store_env
+from lib.generator.storage import (
+    apply_storage_volumes,
+    apply_dshm_size,
+    get_storage_entries,
+    build_storage_pvc_docs,
+)
 
 
 def generate_yaml_single_container(input_yaml, output_file, user_config):
@@ -56,28 +64,37 @@ def generate_yaml_single_container(input_yaml, output_file, user_config):
             {C.NAME: C.ENV_JOB_NAME, C.VALUE: job_name},
         ]
     )
-    if k8s_utils.g_kv_pool_enabled:
-        kv_pool_config = normalize_kv_cache_pool_config(user_config)
-        kv_pool_env = gen_kv_pool_env(kv_pool_config)
-        container[C.ENV].extend(kv_pool_env)
+    if k8s_utils.g_kv_store_enabled:
+        kv_store_config = normalize_kv_cache_store_config(user_config)
+        kv_store_env = gen_kv_store_env(kv_store_config)
+        container[C.ENV].extend(kv_store_env)
 
     npu_num = max(int(deploy_config[C.P_POD_NPU_NUM]), int(deploy_config[C.D_POD_NPU_NUM]))
     set_container_npu(container, npu_num, deploy_config)
 
     hardware_type = deploy_config[C.HARDWARE_TYPE]
+    pod_spec = deployment_data[C.SPEC][C.TEMPLATE][C.SPEC]
+    pod_spec[C.NODE_SELECTOR] = pod_spec.get(C.NODE_SELECTOR, {})
     if hardware_type in C.HARDWARE_TYPE_A2:
-        deployment_data[C.SPEC][C.TEMPLATE][C.SPEC][C.NODE_SELECTOR][C.ACCELERATOR_TYPE] = C.ACCELERATOR_TYPE_910B
+        apply_node_selector_by_hardware(pod_spec, hardware_type)
         del deployment_data[C.SPEC][C.TEMPLATE][C.METADATA][C.ANNOTATIONS]
     elif hardware_type in C.HARDWARE_TYPE_A3:
-        deployment_data[C.SPEC][C.TEMPLATE][C.SPEC][C.NODE_SELECTOR][C.ACCELERATOR_TYPE] = C.ACCELERATOR_TYPE_A3
-        deployment_data[C.SPEC][C.TEMPLATE][C.METADATA][C.ANNOTATIONS][C.SP_BLOCK] = f"{npu_num}"
+        apply_node_selector_by_hardware(pod_spec, hardware_type)
+        k8s_utils.apply_sp_block_annotation(deployment_data[C.SPEC][C.TEMPLATE][C.METADATA], npu_num, hardware_type)
     elif hardware_type in C.HARDWARE_TYPE_950I_A5:
-        pod_spec = deployment_data[C.SPEC][C.TEMPLATE][C.SPEC]
         apply_node_selector_by_hardware(pod_spec, hardware_type)
         apply_a5_engine_pod_config(pod_spec, container, deploy_config)
         apply_a5_workload(deployment_data, deploy_config)
-        deployment_data[C.SPEC][C.TEMPLATE][C.METADATA][C.ANNOTATIONS][C.SP_BLOCK] = f"{npu_num}"
+        k8s_utils.apply_sp_block_annotation(deployment_data[C.SPEC][C.TEMPLATE][C.METADATA], npu_num, hardware_type)
 
     set_engine_weight_mount(deployment_data, container, deploy_config)
+    sc_pod_spec = deployment_data[C.SPEC][C.TEMPLATE][C.SPEC]
+    storage_entries = get_storage_entries(user_config)
+    apply_storage_volumes(sc_pod_spec, container, user_config, storage_entries)
+    apply_dshm_size(sc_pod_spec, user_config)
+    if storage_entries:
+        # Embed the PVC(s) as extra documents so `kubectl apply -f` creates them with the pod.
+        pvc_template = os.path.join(os.path.dirname(input_yaml), "storage_pvc_template.yaml")
+        data.extend(build_storage_pvc_docs(pvc_template, user_config, storage_entries))
 
     write_yaml(data, output_file, False)

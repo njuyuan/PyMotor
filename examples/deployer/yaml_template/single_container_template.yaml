@@ -14,8 +14,6 @@ spec:
       app: mindie-server
   template:
     metadata:
-      annotations:
-        sp-block: "xxxx"
       labels:
         fault-scheduling: grace
         fault-retry-times: "10000"
@@ -82,22 +80,17 @@ spec:
             preStop:
               exec:
                 command: ["bash", "-c", "$CONFIGMAP_PATH/prestop.sh"]
-          command: ["/bin/bash", "-c", "
-              source /mnt/configmap/boot.sh; \n
-          "]
+          command: ["/bin/bash", "-c", "source /mnt/configmap/boot.sh;"]
           resources:
             requests:
               memory: "64Gi"
               cpu: "16"
               huawei.com/Ascend910: 1                         # Number of required NPUs. The maximum value is 16. You can add lines below to configure resources such as memory and CPU.
             limits:
-              memory: "256Gi"
-              cpu: "64"
               huawei.com/Ascend910: 1                         # The value must be consistent with that in requests.
           volumeMounts:
           - name: data
             mountPath: /data
-            readOnly: true
           - name: motor-config
             mountPath: /mnt/configmap
           - name: queue-schedule

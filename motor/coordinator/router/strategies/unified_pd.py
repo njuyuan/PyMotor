@@ -27,6 +27,7 @@ from motor.common.resources.dispatch import (
     MOTOR_PREFILL_RESULT_KEY,
     PrefillResult,
     PrefillResultStatus,
+    PrefillContextBudget,
 )
 from motor.common.resources.endpoint import WorkloadAction
 from motor.common.resources.instance import PDRole
@@ -37,6 +38,7 @@ from motor.coordinator.domain import (
     UpdateWorkloadParams,
 )
 from motor.coordinator.domain.request_manager import RequestManager
+from motor.coordinator.models.constants import OpenAIField
 from motor.coordinator.models.request import RequestInfo, ReqState
 from motor.coordinator.router.dispatch_session import (
     AttemptContext,
@@ -46,6 +48,7 @@ from motor.coordinator.router.dispatch_session import (
 from motor.coordinator.router.dispatch_capability import select_dispatch_plan_for_pair
 from motor.coordinator.router.stop_client import DispatchStopClient
 from motor.coordinator.router.strategies.base import BaseRouter, check_cancel_error
+from motor.coordinator.router.strategies.pd_hybrid import PDHybridRouter
 from motor.coordinator.router.rescheduler.rescheduler import (
     Rescheduler,
     RetryRequestPlan,
@@ -59,6 +62,7 @@ from motor.coordinator.router.stream_response import (
 )
 from motor.coordinator.router.upstream_error import (
     UpstreamHTTPError,
+    is_cb_reportable_failure,
     is_retryable_upstream_error,
 )
 from motor.coordinator.router.adapters.stream import (
@@ -144,6 +148,7 @@ class UnifiedPDRouter(BaseRouter):
         self._stream_commit_controller: StreamCommitController | None = None
         self._stream_body_sent = False
         self._active_retry_plan: RetryRequestPlan | None = None
+        self._hybrid_stream_fallback_attempted = False  # A request is only allowed to fallback once.
         # Task -> its bookkeeping record (dedup key, logging context, computed work item).
         self._release_records: dict[asyncio.Task[bool], _ReleaseTaskRecord] = {}
         # Dedup reverse index: release key -> the single in-flight task for that key.
@@ -211,11 +216,158 @@ class UnifiedPDRouter(BaseRouter):
             return True
         return self.rescheduler.can_resume_after_visible_output(self.req_info.req_data)
 
+    def _build_hybrid_fallback_router(self) -> PDHybridRouter:
+        return PDHybridRouter(
+            self.req_info,
+            self.config,
+            scheduler=self._scheduler,
+            request_manager=self._request_manager,
+            workload_action_handler=self._workload_action_handler,
+            sampling_manager=self._sampling_manager,
+        )
+
+    async def _hybrid_fallback_feasible(self) -> bool:
+        """True when decode pool is exhausted (no unblocked D) but a hybrid candidate exists.
+
+        Shared by the non-stream / stream-restart / stream-resume fallback gates so the
+        ``get_unblocked_instances`` availability probe stays in one place.
+        """
+        get_unblocked = getattr(self._scheduler, "get_unblocked_instances", None)
+        if get_unblocked is None:
+            return False
+        if await get_unblocked(PDRole.ROLE_D):
+            return False
+        unblocked_u = await get_unblocked(PDRole.ROLE_U)
+        unblocked_p = await get_unblocked(PDRole.ROLE_P)
+        return bool(unblocked_u or unblocked_p)
+
+    async def _should_trigger_hybrid_fallback_nonstream(self) -> bool:
+        if self.req_info.req_data.get("stream", False):
+            return False
+        return await self._hybrid_fallback_feasible()
+
+    async def _should_trigger_hybrid_fallback_stream_restart(self) -> bool:
+        if not self.req_info.req_data.get("stream", False):
+            return False
+        if self._hybrid_stream_fallback_attempted:
+            return False
+        if self._stream_body_sent:
+            return False
+        if self._stream_commit_controller is None or self._stream_commit_controller.commit_sealed:
+            return False
+        return await self._hybrid_fallback_feasible()
+
+    async def _should_trigger_hybrid_fallback_stream_resume(self) -> bool:
+        """Post-commit continuation gate: visible output already sent, decode pool gone.
+
+        Requires a replayable token cache (prompt + generated ids) so a single hybrid
+        instance can continue generation on the same SSE stream without repeating output.
+        """
+        if not self.req_info.req_data.get("stream", False):
+            return False
+        if self._hybrid_stream_fallback_attempted:
+            return False
+        if not self._stream_body_sent:
+            return False
+        if not self.rescheduler.can_resume_after_visible_output(self.req_info.req_data):
+            return False
+        return await self._hybrid_fallback_feasible()
+
+    async def _run_hybrid_fallback_nonstream(self) -> JSONResponse:
+        self.logger.warning("UnifiedPD fallback to PDHybrid for non-stream request: decode unavailable")
+        self.req_info.trace_obj.set_trace_error_message(
+            "UnifiedPD fallback to PDHybrid(non-stream): decode unavailable"
+        )
+        hybrid = self._build_hybrid_fallback_router()
+        response = await hybrid.handle_request(manage_request_context=False)
+        if not isinstance(response, JSONResponse):
+            raise RuntimeError("Hybrid fallback expected non-stream JSON response")
+        return response
+
+    async def _run_hybrid_fallback_stream_restart(
+        self,
+        attempt: AttemptContext | None,
+        attempt_index: int,
+    ) -> AsyncGenerator[str, None]:
+        if self._stream_commit_controller is None:
+            raise RuntimeError("Stream fallback requires stream commit controller")
+        fallback_attempt_id = (attempt.attempt_seq + 1) if attempt is not None else (attempt_index + 1)
+        self._hybrid_stream_fallback_attempted = True
+        self._stream_commit_controller.begin_attempt(fallback_attempt_id)
+        self.logger.warning(
+            "UnifiedPD stream fallback to PDHybrid before commit, fallback_attempt=%d",
+            fallback_attempt_id,
+        )
+        self.req_info.trace_obj.set_trace_error_message(
+            "UnifiedPD fallback to PDHybrid(stream restart): decode unavailable"
+        )
+
+        def _mark_unified_ready() -> None:
+            self._stream_commit_controller.mark_ready("prefill", fallback_attempt_id)
+            self._stream_commit_controller.mark_ready("decode", fallback_attempt_id)
+
+        hybrid = self._build_hybrid_fallback_router()
+        async with aclosing(
+            hybrid.stream_fallback_from_existing_context(
+                req_data=self.req_info.req_data.copy(),
+                attempt_id=fallback_attempt_id,
+                mark_unified_ready=_mark_unified_ready,
+            )
+        ) as fallback_stream:
+            async for chunk in fallback_stream:
+                yield chunk
+
+    async def _run_hybrid_fallback_stream_resume(
+        self,
+        attempt: AttemptContext | None,
+        attempt_index: int,
+    ) -> AsyncGenerator[str, None]:
+        """Continue a committed stream on one hybrid instance via token replay.
+
+        The HTTP response is already committed (tokens were sent), so the commit
+        controller is left untouched; the replay body carries prompt + generated
+        token ids so the hybrid leg resumes generation instead of repeating it.
+        """
+        fallback_attempt_id = (attempt.attempt_seq + 1) if attempt is not None else (attempt_index + 1)
+        self._hybrid_stream_fallback_attempted = True
+        self.rescheduler.retry_count = max(attempt_index, 1)
+        retry_plan = self.rescheduler.build_retry_plan(self.req_info.req_data)
+        if retry_plan is None:
+            raise RuntimeError("Hybrid stream resume requires cached token ids for replay")
+        replay_req, replay_api = self.rescheduler.apply_retry_plan(
+            self.req_info.req_data.copy(),
+            retry_plan,
+        )
+        self.logger.warning(
+            "UnifiedPD stream fallback to PDHybrid after commit (token replay), "
+            "fallback_attempt=%d replay_len=%d api=%s",
+            fallback_attempt_id,
+            len(retry_plan.prompt_token_ids),
+            replay_api,
+        )
+        self.req_info.trace_obj.set_trace_error_message(
+            "UnifiedPD fallback to PDHybrid(stream resume): decode unavailable"
+        )
+        hybrid = self._build_hybrid_fallback_router()
+        async with aclosing(
+            hybrid.stream_fallback_from_existing_context(
+                req_data=replay_req,
+                attempt_id=fallback_attempt_id,
+                api=replay_api,
+                is_resume=True,
+            )
+        ) as fallback_stream:
+            async for chunk in fallback_stream:
+                yield chunk
+
     async def _generate_stream_response(self) -> AsyncGenerator[str, None]:
         trace_obj = self.req_info.trace_obj
         with self._trace_span("UnifiedPD_Stream", True):
             max_retry = max(self.config.exception_config.transport_retry_limit, 1)
-            session = PDDispatchSession(self.req_info.req_id)
+            session = PDDispatchSession(
+                self.req_info.req_id,
+                prefill_context_budget=self._prefill_context_budget(),
+            )
 
             async with self._manage_request_context():
                 for attempt_index in range(max_retry):
@@ -266,6 +418,21 @@ class UnifiedPDRouter(BaseRouter):
                             e,
                             allow_retry=self._stream_retry_allowed(),
                         )
+                        if await self._should_trigger_hybrid_fallback_stream_restart():
+                            async with aclosing(
+                                self._run_hybrid_fallback_stream_restart(attempt, attempt_index)
+                            ) as fallback_stream:
+                                async for chunk in fallback_stream:
+                                    yield chunk
+                            return
+                        if await self._should_trigger_hybrid_fallback_stream_resume():
+                            async with aclosing(
+                                self._run_hybrid_fallback_stream_resume(attempt, attempt_index)
+                            ) as fallback_stream:
+                                async for chunk in fallback_stream:
+                                    yield chunk
+                            self.logger.info(trace_obj.set_end_and_ttft_tpot())
+                            return
                         if not retry:
                             raise error
                     finally:
@@ -281,7 +448,10 @@ class UnifiedPDRouter(BaseRouter):
         trace_obj = self.req_info.trace_obj
         with self._trace_span("UnifiedPD", False):
             max_retry = max(self.config.exception_config.transport_retry_limit, 1)
-            session = PDDispatchSession(self.req_info.req_id)
+            session = PDDispatchSession(
+                self.req_info.req_id,
+                prefill_context_budget=self._prefill_context_budget(),
+            )
 
             async with self._manage_request_context():
                 for attempt_index in range(max_retry):
@@ -305,10 +475,13 @@ class UnifiedPDRouter(BaseRouter):
                         return JSONResponse(content=body)
                     except (asyncio.CancelledError, Exception) as e:
                         error, retry = await self._process_response_error(attempt, attempt_index, e)
+                        if await self._should_trigger_hybrid_fallback_nonstream():
+                            return await self._run_hybrid_fallback_nonstream()
                         if not retry:
                             raise error
 
         error_message = "Unified PD request ended without response"
+        trace_obj.set_trace_prompt(self.req_info.req_data)
         trace_obj.set_trace_error_message(error_message)
         raise RuntimeError(error_message)
 
@@ -321,6 +494,7 @@ class UnifiedPDRouter(BaseRouter):
         allow_retry: bool = True,
     ) -> (Exception, bool):
         trace_obj = self.req_info.trace_obj
+        trace_obj.set_trace_prompt(self.req_info.req_data)
         trace_obj.set_trace_exception(error)
         max_retry = max(self.config.exception_config.transport_retry_limit, 1)
 
@@ -376,13 +550,21 @@ class UnifiedPDRouter(BaseRouter):
 
     async def _create_attempt(self, session: PDDispatchSession) -> AttemptContext:
         attempt_seq = session._attempt_seq + 1
+        consumed_output_tokens = (
+            self._active_retry_plan.cached_output_tokens if self._active_retry_plan is not None else 0
+        )
         p_resource = await self._prepare_attempt_resource(PDRole.ROLE_P, attempt_seq)
 
         # Handoff connectors (CPCD-style) do not need a concrete decode endpoint while prefill runs.
         # Allocate D after prefill completes so long prompts do not reserve stale decode workload for
         # the entire prefill window. Concurrent connectors still allocate both legs up front.
         if self._should_defer_decode_allocation(p_resource):
-            return session.new_attempt(p_resource, None, self.config)
+            return session.new_attempt(
+                p_resource,
+                None,
+                self.config,
+                consumed_output_tokens=consumed_output_tokens,
+            )
 
         try:
             d_resource = await self._prepare_attempt_resource(PDRole.ROLE_D, attempt_seq)
@@ -396,7 +578,12 @@ class UnifiedPDRouter(BaseRouter):
             await self._release_attempt_resource(p_resource, attempt_seq, WorkloadAction.RELEASE_TOKENS)
             await self._release_attempt_resource(p_resource, attempt_seq, WorkloadAction.RELEASE_KV)
             raise
-        return session.new_attempt(p_resource, d_resource, self.config)
+        return session.new_attempt(
+            p_resource,
+            d_resource,
+            self.config,
+            consumed_output_tokens=consumed_output_tokens,
+        )
 
     @staticmethod
     def _should_defer_decode_allocation(
@@ -429,16 +616,22 @@ class UnifiedPDRouter(BaseRouter):
             self._client_for(attempt.prefill_resource) as p_client,
             self._client_for(attempt.decode_resource) as d_client,
         ):
+            p_instance_id = attempt.prefill_resource.instance.id
 
             async def prefill_task():
-                response = await self.forward_request(
-                    p_api,
-                    p_req,
-                    p_client,
-                    self.config.exception_config.first_token_timeout,
-                )
-                self._record_prefill_complete(response.json())
-                self._stream_commit_controller.mark_ready("prefill", attempt.attempt_seq)
+                try:
+                    response = await self.forward_request(
+                        p_api, p_req, p_client, self.config.exception_config.first_token_timeout
+                    )
+                    self._record_prefill_complete(response.json())
+                    self._stream_commit_controller.mark_ready("prefill", attempt.attempt_seq)
+                    await self._scheduler.report_cb_event(p_instance_id, "success")
+                except asyncio.CancelledError:  # pylint: disable=try-except-raise
+                    raise
+                except Exception as e:
+                    if is_cb_reportable_failure(e):
+                        await self._scheduler.report_cb_event(p_instance_id, "failure")
+                    raise
 
             p_task = attempt.register_prefill_task(asyncio.create_task(prefill_task()))
             async with aclosing(
@@ -501,6 +694,8 @@ class UnifiedPDRouter(BaseRouter):
         d_req: dict[str, Any],
         d_client,
     ) -> asyncio.Task:
+        d_instance_id = attempt.decode_resource.instance.id
+
         async def decode_task() -> None:
             try:
                 async for chunk in self.forward_stream_request(
@@ -514,10 +709,13 @@ class UnifiedPDRouter(BaseRouter):
                         await queue.put(chunk)
                 if not terminal.done():
                     terminal.set_result(("done", None))
+                await self._scheduler.report_cb_event(d_instance_id, "success")
             except asyncio.CancelledError as e:
                 if not terminal.done():
                     terminal.set_result(("cancel", e))
             except Exception as e:
+                if is_cb_reportable_failure(e):
+                    await self._scheduler.report_cb_event(d_instance_id, "failure")
                 if not terminal.done():
                     terminal.set_result(("error", e))
 
@@ -650,15 +848,21 @@ class UnifiedPDRouter(BaseRouter):
             self._client_for(attempt.prefill_resource) as p_client,
             self._client_for(attempt.decode_resource) as d_client,
         ):
+            p_instance_id = attempt.prefill_resource.instance.id
 
             async def prefill_task():
-                response = await self.forward_request(
-                    p_api,
-                    p_req,
-                    p_client,
-                    self.config.exception_config.first_token_timeout,
-                )
-                self._record_prefill_complete(response.json())
+                try:
+                    response = await self.forward_request(
+                        p_api, p_req, p_client, self.config.exception_config.first_token_timeout
+                    )
+                    self._record_prefill_complete(response.json())
+                    await self._scheduler.report_cb_event(p_instance_id, "success")
+                except asyncio.CancelledError:  # pylint: disable=try-except-raise
+                    raise
+                except Exception as e:
+                    if is_cb_reportable_failure(e):
+                        await self._scheduler.report_cb_event(p_instance_id, "failure")
+                    raise
 
             p_task = attempt.register_prefill_task(asyncio.create_task(prefill_task()))
             return await self._await_nonstream_decode(
@@ -680,13 +884,20 @@ class UnifiedPDRouter(BaseRouter):
         sampling_state: dict | None = None,
         prefill_task: asyncio.Task | None = None,
     ) -> dict[str, Any]:
+        d_instance_id = attempt.decode_resource.instance.id
+
         async def decode_task() -> tuple[Any, Any]:
             try:
                 response = await self.forward_request(
                     d_api, d_req, d_client, self.config.exception_config.infer_timeout
                 )
+                await self._scheduler.report_cb_event(d_instance_id, "success")
                 return response.json(), None
-            except (asyncio.CancelledError, Exception) as e:
+            except asyncio.CancelledError:  # pylint: disable=try-except-raise
+                raise
+            except Exception as e:
+                if is_cb_reportable_failure(e):
+                    await self._scheduler.report_cb_event(d_instance_id, "failure")
                 return None, e
 
         d_task = attempt.register_decode_task(asyncio.create_task(decode_task()))
@@ -832,10 +1043,20 @@ class UnifiedPDRouter(BaseRouter):
         return True
 
     async def _await_handoff_prefill(self, attempt: AttemptContext, p_client) -> PrefillResult:
+        p_instance_id = attempt.prefill_resource.instance.id
+
         async def prefill_task():
-            result = await self._request_prefill_result(attempt, p_client)
-            attempt.unregister_prefill_canceller()
-            return result
+            try:
+                result = await self._request_prefill_result(attempt, p_client)
+                await self._scheduler.report_cb_event(p_instance_id, "success")
+                attempt.unregister_prefill_canceller()
+                return result
+            except asyncio.CancelledError:  # pylint: disable=try-except-raise
+                raise
+            except Exception as e:
+                if is_cb_reportable_failure(e):
+                    await self._scheduler.report_cb_event(p_instance_id, "failure")
+                raise
 
         p_task = attempt.register_prefill_task(asyncio.create_task(prefill_task()))
         return await p_task
@@ -872,6 +1093,17 @@ class UnifiedPDRouter(BaseRouter):
         if prefill_result is not None:
             req[MOTOR_PREFILL_RESULT_KEY] = prefill_result.model_dump(mode="json")
         return (req, api)
+
+    def _prefill_context_budget(self) -> PrefillContextBudget | None:
+        """Return the client budget before the prefill leg is rewritten to one token."""
+        for field in (OpenAIField.MAX_COMPLETION_TOKENS, OpenAIField.MAX_TOKENS):
+            value = self.req_info.req_data.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return PrefillContextBudget(
+                    max_output_tokens=value,
+                    parameter=field.value,
+                )
+        return None
 
     async def _request_prefill_result(self, attempt: AttemptContext, p_client) -> PrefillResult:
         p_req, p_api = self._request_for_attempt(attempt, PDRole.ROLE_P)
@@ -1104,6 +1336,12 @@ class UnifiedPDRouter(BaseRouter):
             req_id=self.req_info.req_id,
             workload_action=action,
             workload_change=workload_change,
+            # Deterministic id keyed on (request, attempt, endpoint, action): stable across the
+            # retries in _send_release_work_item, so a release whose ACK was lost is de-duplicated by
+            # the scheduler instead of applied twice (which would drive the load ledger negative).
+            operation_id=(
+                f"{self.req_info.req_id}:a{attempt_seq}:{resource.instance.id}:{resource.endpoint.id}:{action.value}"
+            ),
         )
         return ReleaseWorkItem(
             stage=self._release_stage(resource, action),
@@ -1481,10 +1719,12 @@ class UnifiedPDRouter(BaseRouter):
                 self.req_info.p_instance_id = schedule_resource.instance.id
             return resp_json
         except asyncio.CancelledError:
+            self.req_info.trace_obj.set_trace_prompt(self.req_info.req_data)
             self.logger.info("Metaserver request was cancelled")
             self.req_info.cancel_scope()
             raise
         except Exception:
+            self.req_info.trace_obj.set_trace_prompt(self.req_info.req_data)
             self.req_info.cancel_scope()
             self.req_info.update_state(ReqState.EXCEPTION)
             raise
@@ -1505,3 +1745,7 @@ class UnifiedPDRouter(BaseRouter):
             await task
         except asyncio.CancelledError:
             pass
+
+    # ------------------------------------------------------------------
+    # Circuit breaker reporting helpers
+    # ------------------------------------------------------------------

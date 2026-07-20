@@ -34,6 +34,9 @@ from motor.engine_server.core.dispatch_adapter.normalization import (
     normalize_nonstream_body,
     normalize_stream_chunk,
 )
+from motor.engine_server.core.vllm.prefill_context_validation import (
+    PrefillContextCheck,
+)
 
 
 class VLLMDispatchAdapter(DispatchAdapter):
@@ -54,6 +57,27 @@ class VLLMDispatchAdapter(DispatchAdapter):
     def __init__(self, config) -> None:
         super().__init__(config)
         self._dispatch_profile = self._infer_dispatch_profile(config)
+
+    def map_engine_error(self, exc: Exception, context: DispatchResponseContext) -> Response:
+        from motor.engine_server.core.vllm.vllm_openai_compat import openai_http_response_from_exception
+
+        return openai_http_response_from_exception(exc)
+
+    def register_error_handlers(self, app: Any) -> None:
+        from motor.engine_server.core.vllm.vllm_openai_compat import register_vllm_openai_error_handlers
+
+        register_vllm_openai_error_handlers(app)
+
+    def map_serving_exception(self, exc: Exception, *, has_dispatch: bool) -> Exception:
+        # vLLM's native create_error_response() must see the original
+        # exception.  Pre-converting it to HTTPException changes both type and
+        # message semantics compared with standalone vLLM.
+        return exc
+
+    def map_stream_error(self, exc: Exception, context: DispatchResponseContext) -> str | None:
+        from motor.engine_server.core.vllm.vllm_openai_compat import vllm_stream_error_json
+
+        return vllm_stream_error_json(exc)
 
     async def _adapt_engine_body(self, body: dict[str, Any], dispatch: MotorDispatch) -> dict[str, Any]:
         body["request_id"] = dispatch.engine_request_id
@@ -84,6 +108,24 @@ class VLLMDispatchAdapter(DispatchAdapter):
                     {"do_remote_decode": True, "do_remote_prefill": False},
                 )
         return body
+
+    def get_prefill_context_check(
+        self,
+        dispatch: MotorDispatch | None,
+    ) -> PrefillContextCheck | None:
+        """Read the Coordinator-carried budget after P request rewriting."""
+        if (
+            dispatch is None
+            or dispatch.role != "prefill"
+            or not self._uses_handoff(dispatch)
+            or dispatch.prefill_context_budget is None
+        ):
+            return None
+        budget = dispatch.prefill_context_budget
+        return PrefillContextCheck(
+            max_output_tokens=budget.max_output_tokens,
+            parameter=budget.parameter,
+        )
 
     async def maybe_prepare_response(
         self, body: dict[str, Any], dispatch: MotorDispatch | None
@@ -184,6 +226,12 @@ class VLLMDispatchAdapter(DispatchAdapter):
         if not isinstance(body, dict):
             return response
         if context.dispatch is not None and context.dispatch.role == "prefill" and self._uses_handoff(context.dispatch):
+            # Only successful prefill responses are valid handoff results.
+            # Preserve validation and serving errors with their original HTTP
+            # status and OpenAI-compatible error body.
+            status_code = getattr(response, "status_code", 200)
+            if not 200 <= status_code < 300 or body.get("error") is not None:
+                return response
             # The decode leg consumes ``payload`` directly as its ``kv_transfer_params``
             # (see ``_consume_prefill_result``), and the engine connector reads the KV
             # bootstrap fields (do_remote_prefill, remote_block_ids, remote_host, ...) at

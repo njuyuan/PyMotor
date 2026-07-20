@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -224,6 +223,26 @@ def test_from_json_maps_hybrid_instances(_temp_json_file):
     assert config.deploy_config.hybrid_pod_npu_num == 4
     assert config.deploy_config.p_instances_num == 3
     assert config.deploy_config.d_instances_num == 3
+
+
+def test_from_json_maps_pd_fallback_switch_from_scheduler_config(_temp_json_file):
+    user_config = {
+        "motor_deploy_config": {
+            "p_instances_num": 1,
+            "d_instances_num": 1,
+        },
+        "motor_coordinator_config": {
+            "scheduler_config": {
+                "enable_pd_separation_fallback_to_hybrid": False,
+            }
+        },
+    }
+    with open(_temp_json_file, 'w', encoding="utf-8") as f:
+        json.dump(user_config, f)
+
+    config = CoordinatorConfig.from_json(_temp_json_file)
+
+    assert config.scheduler_config.enable_pd_separation_fallback_to_hybrid is False
 
 
 def test_from_json_with_invalid_json(_temp_json_file):
@@ -499,9 +518,52 @@ def test_config_summary_includes_hybrid_fields(_temp_json_file):
     config = CoordinatorConfig.from_json(_temp_json_file)
     summary = config.get_config_summary()
 
-    assert "hybrid_instances_num: 3" in summary
+    assert "hybrid_instances_num:   3" in summary
     assert "single_hybrid_instance_pod_num: 1" in summary
-    assert "hybrid_pod_npu_num: 4" in summary
+    assert "hybrid_pod_npu_num:     4" in summary
+    assert "??" not in summary
+
+
+def test_config_summary_pd_disaggregation_fields(_temp_json_file):
+    """Test configuration summary shows P/D fields for disaggregated deploy."""
+    user_config = {
+        "motor_deploy_config": {
+            "p_instances_num": 2,
+            "d_instances_num": 3,
+        },
+        "motor_engine_prefill_config": {
+            "engine_type": "vllm",
+            "model_config": {
+                "model_name": "qwen3-8B",
+                "model_path": "/mnt/weight/qwen3_8B",
+                "npu_mem_utils": 0.9,
+                "parallel_config": {"dp_size": 1, "tp_size": 2, "pp_size": 1},
+            },
+            "engine_config": {"max_model_len": 2048},
+        },
+        "motor_engine_decode_config": {
+            "engine_type": "vllm",
+            "model_config": {
+                "model_name": "qwen3-8B",
+                "model_path": "/mnt/weight/qwen3_8B",
+                "npu_mem_utils": 0.9,
+                "parallel_config": {"dp_size": 1, "tp_size": 2, "pp_size": 1},
+            },
+            "engine_config": {"max_model_len": 2048},
+        },
+    }
+    with open(_temp_json_file, 'w', encoding="utf-8") as f:
+        json.dump(user_config, f)
+
+    config = CoordinatorConfig.from_json(_temp_json_file)
+    summary = config.get_config_summary()
+
+    assert "p_instances_num:" in summary
+    assert "d_instances_num:" in summary
+    assert "p_instances_num:     2" in summary
+    assert "d_instances_num:     3" in summary
+    assert "hybrid_instances_num" not in summary
+    assert "??" not in summary
 
 
 def test_multiple_instances():
@@ -588,14 +650,14 @@ def test_from_json_maps_union_kv_events_to_prefill_kv_event_config(_temp_json_fi
         json.dump(user_config, f)
 
     config = CoordinatorConfig.from_json(_temp_json_file)
-    kr = config.scheduler_config.kv_conductor_config
+    pk = config.prefill_kv_event_config
 
     assert config.scheduler_config.scheduler_type.value == "kv_cache_affinity"
-    assert kr.endpoint == "tcp://*:5557"
-    assert kr.replay_endpoint == "tcp://*:6667"
-    assert kr.model_path == "/mnt/weight/qwen3_8B"
-    assert kr.http_server_port == 14444
-    assert kr.block_size == 64
+    assert pk.endpoint == "tcp://*:5557"
+    assert pk.replay_endpoint == "tcp://*:6667"
+    assert pk.model_path == "/mnt/weight/qwen3_8B"
+    assert pk.http_server_port == 14444
+    assert pk.block_size == 64
 
 
 def test_from_json_prefill_kv_event_prefers_prefill_over_union(_temp_json_file):
@@ -628,11 +690,11 @@ def test_from_json_prefill_kv_event_prefers_prefill_over_union(_temp_json_file):
         json.dump(user_config, f)
 
     config = CoordinatorConfig.from_json(_temp_json_file)
-    kr = config.scheduler_config.kv_conductor_config
+    pk = config.prefill_kv_event_config
 
-    assert kr.endpoint == "tcp://*:1111"
-    assert kr.replay_endpoint == "tcp://*:2222"
-    assert kr.model_path == "/prefill/model"
+    assert pk.endpoint == "tcp://*:1111"
+    assert pk.replay_endpoint == "tcp://*:2222"
+    assert pk.model_path == "/prefill/model"
 
 
 def test_from_json_union_without_kv_events_skips_auto_merge(_temp_json_file):
@@ -652,8 +714,8 @@ def test_from_json_union_without_kv_events_skips_auto_merge(_temp_json_file):
 
     config = CoordinatorConfig.from_json(_temp_json_file)
 
-    assert config.scheduler_config.kv_conductor_config.endpoint == ""
-    assert config.scheduler_config.kv_conductor_config.model_path == ""
+    assert config.prefill_kv_event_config.endpoint == ""
+    assert config.prefill_kv_event_config.model_path == ""
 
 
 def test_from_json_maps_prefill_kv_events_regression(_temp_json_file):
@@ -676,10 +738,10 @@ def test_from_json_maps_prefill_kv_events_regression(_temp_json_file):
         json.dump(user_config, f)
 
     config = CoordinatorConfig.from_json(_temp_json_file)
-    kr = config.scheduler_config.kv_conductor_config
+    pk = config.prefill_kv_event_config
 
-    assert kr.endpoint == "tcp://*:5557"
-    assert kr.replay_endpoint == "tcp://*:6667"
-    assert kr.model_path == "/mnt/weight/qwen3_8B"
-    assert kr.http_server_port == 15555
-    assert kr.block_size == 32
+    assert pk.endpoint == "tcp://*:5557"
+    assert pk.replay_endpoint == "tcp://*:6667"
+    assert pk.model_path == "/mnt/weight/qwen3_8B"
+    assert pk.http_server_port == 15555
+    assert pk.block_size == 32

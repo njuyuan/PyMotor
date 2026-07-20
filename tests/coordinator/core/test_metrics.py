@@ -27,7 +27,7 @@ from motor.coordinator.metrics.metrics_collector import (
     MetricsCollector,
     MetricType,
     Metric,
-    _filter_kvpool_metrics,
+    _filter_kvstore_metrics,
 )
 from motor.config.coordinator import CoordinatorConfig
 from motor.common.utils.singleton import ThreadSafeSingleton
@@ -364,17 +364,129 @@ vllm:num_requests_running{engine="0",model_name="/job/model/Qwen2.5-0.5B-Instruc
 vllm:num_requests_running{engine="0",model_name="/job/model/Qwen2.5-0.5B-Instruct"} -1.0"""
 
         metric_collector = MetricsCollector(self.config)
+        # Illegal TYPE is a structural failure → None (not an empty success list).
         result = metric_collector._parse_metric_text(metrics_str_type_error)
-        assert isinstance(result, list)
-        assert len(result) == 0
+        assert result is None
 
         result = metric_collector._parse_metric_text(metrics_str_value_type_error)
+        assert result is None
+
+        result = metric_collector._parse_metric_text(metrics_str_value_error)
+        assert result is None
+
+    @_test_without_background_thread
+    def test_parse_metrics_text_resilient(self):
+        metric_collector = MetricsCollector(self.config)
+
+        # A negative gauge sample is legitimate and must be kept.
+        gauge_negative = """
+# HELP g_metric a gauge
+# TYPE g_metric gauge
+g_metric{engine="0"} -0.5"""
+        result = metric_collector._parse_metric_text(gauge_negative)
+        assert len(result) == 1
+        assert result[0].type == MetricType.GAUGE
+        assert result[0].value == [-0.5]
+
+        # A label value containing spaces must survive parsing.
+        label_with_space = """
+# HELP s_metric a gauge
+# TYPE s_metric gauge
+s_metric{name="prepare input"} 3.0"""
+        result = metric_collector._parse_metric_text(label_with_space)
+        assert len(result) == 1
+        assert result[0].value == [3.0]
+
+        # A counter whose only sample is negative is corrupt; the family has no
+        # valid sample and must be dropped rather than returned with empty arrays.
+        counter_all_bad = """
+# HELP c_metric a counter
+# TYPE c_metric counter
+c_metric{engine="0"} -1.0"""
+        result = metric_collector._parse_metric_text(counter_all_bad)
         assert isinstance(result, list)
         assert len(result) == 0
 
-        result = metric_collector._parse_metric_text(metrics_str_value_error)
-        assert isinstance(result, list)
-        assert len(result) == 0
+        # One corrupt family must not take down the healthy families around it.
+        mixed = """
+# HELP c_metric a counter
+# TYPE c_metric counter
+c_metric{engine="0"} -1.0
+# HELP g_metric a gauge
+# TYPE g_metric gauge
+g_metric{engine="0"} 2.0"""
+        result = metric_collector._parse_metric_text(mixed)
+        assert len(result) == 1
+        assert result[0].name == "g_metric"
+        assert result[0].value == [2.0]
+
+        # Empty family (HELP+TYPE, no samples): keep family; serializers emit 0.
+        empty_family = """
+# HELP e_metric empty
+# TYPE e_metric gauge
+# HELP g_metric a gauge
+# TYPE g_metric gauge
+g_metric{engine="0"} 1.0"""
+        result = metric_collector._parse_metric_text(empty_family)
+        assert len(result) == 2
+        assert result[0].name == "e_metric"
+        assert result[0].label == []
+        assert result[0].value == []
+        assert result[1].name == "g_metric"
+        assert result[1].value == [1.0]
+        text = metric_collector._format_prometheus(result)
+        assert "e_metric 0" in text
+        assert "g_metric{engine=\"0\"} 1.0" in text
+
+        # Explicit zero sample must remain visible after prometheus formatting.
+        zero_sample = """
+# HELP z_metric a gauge
+# TYPE z_metric gauge
+z_metric{engine="0"} 0.0"""
+        result = metric_collector._parse_metric_text(zero_sample)
+        assert len(result) == 1
+        assert result[0].value == [0.0]
+        text = metric_collector._format_prometheus(result)
+        assert "z_metric{engine=\"0\"} 0.0" in text or "z_metric{engine=\"0\"} 0" in text
+
+        # Empty label/value family still serializes as an explicit 0 line.
+        empty_metric = Metric(name="idle_metric", help="idle", type=MetricType.GAUGE, label=[], value=[])
+        text = metric_collector._format_prometheus([empty_metric])
+        assert "# HELP idle_metric idle" in text
+        assert "# TYPE idle_metric gauge" in text
+        assert "idle_metric 0" in text
+
+        # Large negative gauge (scale+interrupt style) must be kept.
+        big_neg = """
+# HELP rate_metric a gauge
+# TYPE rate_metric gauge
+rate_metric{engine="0"} -335927.113155146
+# HELP ok_metric a gauge
+# TYPE ok_metric gauge
+ok_metric{engine="0"} 3.0"""
+        result = metric_collector._parse_metric_text(big_neg)
+        assert len(result) == 2
+        assert result[0].name == "rate_metric"
+        assert result[0].value == [-335927.113155146]
+        assert result[1].name == "ok_metric"
+        assert result[1].value == [3.0]
+
+        # All families dropped → empty list (success), not None / not collect failure.
+        all_dropped = """
+# HELP c_metric a counter
+# TYPE c_metric counter
+c_metric{engine="0"} -1.0"""
+        result = metric_collector._parse_metric_text(all_dropped)
+        assert result == []
+        collects = {
+            1: {
+                "endpoints": {
+                    0: {"metrics_str": all_dropped},
+                }
+            }
+        }
+        assert metric_collector._parse_metrics(collects) is True
+        assert collects[1]["endpoints"][0][metric_collector.METRICS_KEY] == []
 
     @_test_without_background_thread
     def test_clear_inactive_metrics(self):
@@ -982,7 +1094,7 @@ def test_generate_role_metrics_empty():
 # ---------------------------------------------------------------------------
 
 
-def test_filter_kvpool_metrics_keeps_allowlist_and_renames():
+def test_filter_kvstore_metrics_mooncake():
     raw = (
         "master_allocated_bytes 1073741824\n"
         "master_total_capacity_bytes 8589934592\n"
@@ -992,21 +1104,45 @@ def test_filter_kvpool_metrics_keeps_allowlist_and_renames():
         "master_attempted_evictions_total 15\n"
         "master_ping_requests_total 5\n"
     )
-    out = _filter_kvpool_metrics(raw)
-    assert 'kv_pool_size{layer="all",stat="total"} 10.0' in out
-    assert 'kv_pool_size{layer="all",stat="usage"} 2.0' in out
-    assert 'kv_pool_ratio{layer="all",stat="usage_rate"} 0.2' in out
-    assert 'kv_pool_ratio{layer="cpu",stat="usage_rate"} 0.125' in out
-    assert 'kv_pool_eviction{stat="success"} 12.0' in out
+    out = _filter_kvstore_metrics(raw, "")
+    assert 'kv_store_size{layer="all",stat="total"} 10.0' in out
+    assert 'kv_store_size{layer="all",stat="usage"} 2.0' in out
+    assert 'kv_store_ratio{layer="all",stat="usage_rate"} 0.2' in out
+    assert 'kv_store_ratio{layer="cpu",stat="usage_rate"} 0.125' in out
+    assert 'kv_store_eviction{stat="success"} 12.0' in out
     assert "master_ping_requests_total" not in out
-    assert 'kv_pool_keys 0.0' in out
-    assert "kv_pool_query" not in out
+    assert 'kv_store_keys 0.0' in out
+    assert "kv_store_query" not in out
     assert "hit_rate" not in out
     assert out.count("# HELP ") == 4
 
 
+def test_filter_kvstore_metrics_memcache():
+    raw = (
+        "memcache_alloc_requests_total 42\n"
+        "memcache_stored_keys 3\n"
+        'memcache_total_capacity_bytes{medium="dram"} 21474836480\n'
+        'memcache_allocated_bytes{medium="dram"} 1073741824\n'
+        "memcache_evict_operations_total 5\n"
+    )
+    out = _filter_kvstore_metrics(raw, "memcache")
+    # 20 GB total, 1 GB usage → ratio 0.05
+    assert 'kv_store_size{layer="cpu",stat="total"} 20.0' in out
+    assert 'kv_store_size{layer="cpu",stat="usage"} 1.0' in out
+    assert 'kv_store_size{layer="ssd",stat="total"} 0.0' in out
+    assert 'kv_store_ratio{layer="cpu",stat="usage_rate"} 0.05' in out
+    assert 'kv_store_keys 3.0' in out
+    assert 'kv_store_eviction{stat="success"} 5.0' in out
+    assert 'kv_store_eviction{stat="attempts"} 0.0' in out
+    # Pass-through: raw memcache_* renamed to motor:memcache_*
+    assert 'motor:memcache_alloc_requests_total 42' in out
+    assert 'motor:memcache_stored_keys 3' in out
+    assert 'motor:memcache_total_capacity_bytes{medium="dram"} 21474836480' in out
+    assert 'motor:memcache_evict_operations_total 5' in out
+
+
 @patch("threading.Thread.start", MagicMock())
-def test_get_metrics_full_with_pool_append():
+def test_get_metrics_full_with_kv_store_append():
     _cleanup_singletons()
     config = CoordinatorConfig()
     collector = MetricsCollector(config)
@@ -1022,11 +1158,11 @@ def test_get_metrics_full_with_pool_append():
         0: {"role": "prefill", "endpoints": {0: {"metrics": [metric], "pod_ip": "10.0.0.1"}}},
     }
     collector._collects_version = 1
-    collector._pool_metrics_text = "# HELP pool_metric pool\npool_metric 1.0\n"
+    collector._kv_store_metrics_text = "# HELP kv_store_metric kv_store\nkv_store_metric 1.0\n"
 
     result = collector.get_metrics(metrics_type="full")
     assert "test_metric" in result
-    assert "pool_metric" in result
+    assert "kv_store_metric" in result
     _cleanup_singletons()
 
 
